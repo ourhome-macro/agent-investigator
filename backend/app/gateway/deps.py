@@ -446,6 +446,17 @@ async def langgraph_runtime(app: FastAPI, startup_config: AppConfig) -> AsyncGen
         stack.push_async_callback(close_engine)
         await init_engine_from_config(config.database)
 
+        # Competitive Research owns an independent Alembic version chain but
+        # shares the Gateway engine. Core DeerFlow migrations have completed at
+        # this point; CI migration failures are fatal because the product must
+        # never boot with a partially available evidence store.
+        from app.investigations.persistence import upgrade_investigation_schema
+        from deerflow.persistence.engine import get_engine
+
+        investigation_engine = get_engine()
+        if investigation_engine is not None:
+            await upgrade_investigation_schema(investigation_engine)
+
         app.state.checkpointer = await stack.enter_async_context(make_checkpointer(config))
         app.state.store = await stack.enter_async_context(make_store(config))
 
@@ -461,16 +472,19 @@ async def langgraph_runtime(app: FastAPI, startup_config: AppConfig) -> AsyncGen
         # Initialize repositories — one get_session_factory() call for all.
         sf = get_session_factory()
         if sf is not None:
+            from app.investigations.repository import InvestigationRepository
             from deerflow.persistence.feedback import FeedbackRepository
             from deerflow.persistence.personal_access_tokens import PersonalAccessTokenRepository
             from deerflow.persistence.run import RunRepository
 
             app.state.run_store = RunRepository(sf)
+            app.state.investigation_repo = InvestigationRepository(sf)
             app.state.feedback_repo = FeedbackRepository(sf)
             from app.gateway.auth.pat import PAT_LAST_USED_WRITE_INTERVAL_SECONDS
 
             app.state.pat_repo = PersonalAccessTokenRepository(sf, last_used_write_interval_seconds=PAT_LAST_USED_WRITE_INTERVAL_SECONDS)
         else:
+            app.state.investigation_repo = None
             from deerflow.runtime.runs.store.memory import MemoryRunStore
 
             app.state.run_store = MemoryRunStore()

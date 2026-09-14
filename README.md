@@ -1661,6 +1661,19 @@ performs a production static-demo build for the fixture-backed workspace routes.
 It measures the unique JavaScript and CSS referenced by representative routes
 and writes the detailed result to `.next/performance-results.json`.
 
+## Competitive Research V1
+
+DeerFlow includes a first-class, auditable competitive-research workflow at
+`/workspace/investigations`. It provides scope approval, multi-provider web
+collection, deterministic evidence scoring, Claim-to-Evidence auditing, report
+review, and Markdown/browser-PDF delivery. The domain API is mounted at
+`/api/investigations`; its independent `alembic_version_ci` migration chain is
+applied after core DeerFlow migrations and fails startup closed.
+
+Development may fall back to DDGS. Production research requires at least
+`BOCHA_API_KEY` or `TAVILY_API_KEY`; `JINA_API_KEY` enables full-page extraction.
+See [Competitive Research V1](docs/COMPETITIVE_RESEARCH_V1_SPEC.md).
+
 ## License
 
 This project is open source and available under the [MIT License](./LICENSE).

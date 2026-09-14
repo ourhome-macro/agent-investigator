@@ -338,6 +338,7 @@ export const enUS: Translations = {
     demoChats: "Demo chats",
     agents: "Agents",
     scheduledTasks: "Scheduled tasks",
+    competitiveResearch: "Competitive research",
     agentsDisabledTooltip: "Feature not enabled",
   },
   // Sidebar projects section

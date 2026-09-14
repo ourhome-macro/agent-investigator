@@ -46,6 +46,14 @@ E2E tests live under `tests/e2e/` and use Playwright with Chromium. They mock al
 
 ## Architecture
 
+### Competitive Research workspace
+
+`app/workspace/investigations/` is the dedicated scope-approval, evidence,
+Claim-audit, and report-review UI. Its API client lives in
+`core/investigations/`; keep mutations on the shared authenticated/CSRF
+fetcher. Investigation pages poll durable domain state rather than treating one
+connection as the task, and must preserve explicit `uncertain` Claim labels.
+
 ```
 Frontend (Next.js) ──▶ LangGraph SDK ──▶ LangGraph Backend (lead_agent)
                                               ├── Sub-Agents

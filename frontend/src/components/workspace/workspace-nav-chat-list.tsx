@@ -1,6 +1,11 @@
 "use client";
 
-import { BotIcon, CalendarClock, MessagesSquare } from "lucide-react";
+import {
+  BotIcon,
+  CalendarClock,
+  FlaskConical,
+  MessagesSquare,
+} from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 
@@ -25,6 +30,20 @@ export function WorkspaceNavChatList() {
   return (
     <SidebarGroup className="pt-1">
       <SidebarMenu>
+        <SidebarMenuItem>
+          <SidebarMenuButton
+            isActive={pathname.startsWith("/workspace/investigations")}
+            asChild
+          >
+            <Link
+              className="text-muted-foreground"
+              href="/workspace/investigations"
+            >
+              <FlaskConical />
+              <span>{t.sidebar.competitiveResearch}</span>
+            </Link>
+          </SidebarMenuButton>
+        </SidebarMenuItem>
         <SidebarMenuItem>
           <SidebarMenuButton isActive={pathname === "/workspace/chats"} asChild>
             <Link className="text-muted-foreground" href="/workspace/chats">

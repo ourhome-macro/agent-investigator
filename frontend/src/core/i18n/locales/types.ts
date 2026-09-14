@@ -255,6 +255,7 @@ export interface Translations {
     demoChats: string;
     agents: string;
     scheduledTasks: string;
+    competitiveResearch: string;
     agentsDisabledTooltip: string;
     channels: string;
   };

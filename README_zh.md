@@ -904,6 +904,17 @@ Docker 部署栈默认只把入口端口发布在 `127.0.0.1` 上，与上文所
 
 目前回归测试已经覆盖 Docker sandbox 模式识别，以及 `backend/tests/` 中 provisioner kubeconfig-path 处理相关测试。
 
+## 竞品深度调研 V1
+
+DeerFlow 新增一等竞品调研工作流，入口为 `/workspace/investigations`。它包含
+开题审批、多供应商网页采集、确定性证据评分、Claim-Evidence 审计、报告审批、
+Markdown 下载和浏览器 PDF 打印。领域 API 位于 `/api/investigations`；独立的
+`alembic_version_ci` 迁移链在 DeerFlow 主迁移后执行，失败会阻止 Gateway 就绪。
+
+开发环境可回退 DDGS；生产环境至少需要 `BOCHA_API_KEY` 或
+`TAVILY_API_KEY`，配置 `JINA_API_KEY` 后可抽取网页全文。详见
+[Competitive Research V1](docs/COMPETITIVE_RESEARCH_V1_SPEC.md)。
+
 ## 许可证
 
 本项目采用 [MIT License](./LICENSE) 开源发布。

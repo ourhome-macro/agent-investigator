@@ -28,6 +28,7 @@ from app.gateway.routers import (
     github_webhooks,
     input_polish,
     integrations,
+    investigations,
     mcp,
     mcp_tasks,
     memory,
@@ -429,7 +430,23 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 set_subagent_batch_submitter(batch_service)
                 app.state.subagent_batches_available = True
 
+        # Competitive Research is a first-class product service. Repository
+        # availability is established by langgraph_runtime after the CI
+        # migration chain succeeds.
+        investigation_repo = getattr(app.state, "investigation_repo", None)
+        if investigation_repo is not None:
+            from app.investigations.service import InvestigationWorkflowService
+
+            app.state.investigation_workflow_service = InvestigationWorkflowService(investigation_repo)
+            await app.state.investigation_workflow_service.start()
+
         yield
+
+        if getattr(app.state, "investigation_workflow_service", None) is not None:
+            try:
+                await app.state.investigation_workflow_service.stop()
+            except Exception:
+                logger.exception("Failed to stop Competitive Research workflow service")
 
         try:
             await auth.close_oidc_service()
@@ -837,6 +854,9 @@ This gateway provides runtime endpoints for agent runs plus custom endpoints for
 
     # Input polishing API is mounted at /api/input-polish
     app.include_router(input_polish.router)
+
+    # Competitive Research domain API.
+    app.include_router(investigations.router)
 
     # User-facing IM channel connection API is mounted at /api/channels
     app.include_router(channel_connections.router)

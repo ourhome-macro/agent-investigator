@@ -317,6 +317,7 @@ export const zhCN: Translations = {
     demoChats: "演示对话",
     agents: "智能体",
     scheduledTasks: "定时任务",
+    competitiveResearch: "竞品调研",
     agentsDisabledTooltip: "功能未启用",
   },
   // Sidebar projects section
