@@ -435,9 +435,34 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # migration chain succeeds.
         investigation_repo = getattr(app.state, "investigation_repo", None)
         if investigation_repo is not None:
+            from app.investigations.batch_adapter import DurableStageBatchAdapter
+            from app.investigations.orchestrator import DurableCompetitiveOrchestrator
+            from app.investigations.run_adapter import DeerFlowRunStageAdapter
             from app.investigations.service import InvestigationWorkflowService
 
-            app.state.investigation_workflow_service = InvestigationWorkflowService(investigation_repo)
+            orchestration_repo = getattr(app.state, "investigation_orchestration_repo", None)
+            durable_orchestrator = None
+            if orchestration_repo is not None and getattr(app.state, "subagent_batches_available", False) and getattr(app.state, "subagent_batch_service", None) is not None and batch_repo is not None:
+                owner_id = f"competitive-research:{id(app)}"
+                batch_adapter = DurableStageBatchAdapter(
+                    service=app.state.subagent_batch_service,
+                    batch_repository=batch_repo,
+                    orchestration=orchestration_repo,
+                )
+                run_adapter = DeerFlowRunStageAdapter.from_app(app)
+                durable_orchestrator = DurableCompetitiveOrchestrator(
+                    investigations=investigation_repo,
+                    orchestration=orchestration_repo,
+                    batches=batch_adapter,
+                    runs=run_adapter,
+                    owner_id=owner_id,
+                )
+            app.state.investigation_workflow_service = InvestigationWorkflowService(
+                investigation_repo,
+                orchestration_repository=orchestration_repo,
+                durable_orchestrator=durable_orchestrator,
+                owner_id=owner_id if durable_orchestrator is not None else None,
+            )
             await app.state.investigation_workflow_service.start()
 
         yield

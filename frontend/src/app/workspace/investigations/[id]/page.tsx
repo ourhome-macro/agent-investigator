@@ -10,13 +10,17 @@ import {
   approveScope,
   getInvestigation,
   getLatestReport,
+  listAuditIssues,
   listClaims,
   listEvidence,
+  listStageItems,
   rejectReport,
+  type AuditIssue,
   type Claim,
   type Evidence,
   type Investigation,
   type Report,
+  type StageItem,
 } from "@/core/investigations";
 
 export default function InvestigationPage() {
@@ -26,20 +30,32 @@ export default function InvestigationPage() {
   );
   const [evidence, setEvidence] = useState<Evidence[]>([]);
   const [claims, setClaims] = useState<Claim[]>([]);
+  const [auditIssues, setAuditIssues] = useState<AuditIssue[]>([]);
   const [report, setReport] = useState<Report | null>(null);
+  const [stageItems, setStageItems] = useState<StageItem[]>([]);
   const [error, setError] = useState<string | null>(null);
   const load = useCallback(async () => {
     try {
       const current = await getInvestigation(id);
       setInvestigation(current);
-      const [nextEvidence, nextClaims, nextReport] = await Promise.all([
+      const [
+        nextEvidence,
+        nextClaims,
+        nextAuditIssues,
+        nextReport,
+        nextStageItems,
+      ] = await Promise.all([
         listEvidence(id),
         listClaims(id),
+        listAuditIssues(id),
         getLatestReport(id),
+        listStageItems(id),
       ]);
       setEvidence(nextEvidence);
       setClaims(nextClaims);
+      setAuditIssues(nextAuditIssues);
       setReport(nextReport);
+      setStageItems(nextStageItems);
       setError(null);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "加载失败");
@@ -112,6 +128,47 @@ export default function InvestigationPage() {
         ))}
       </section>
       <section className="space-y-3">
+        <div className="flex items-center justify-between">
+          <h2 className="text-xl font-medium">Agent / Batch Items</h2>
+          <span className="text-muted-foreground text-sm">
+            {stageItems.filter((item) => item.status === "succeeded").length}/
+            {stageItems.length} 完成
+          </span>
+        </div>
+        <div className="overflow-hidden rounded-xl border">
+          {stageItems.length === 0 ? (
+            <p className="text-muted-foreground p-5 text-sm">
+              创建调研后将显示每个 Agent / Batch Item 的执行与自动重试状态。
+            </p>
+          ) : (
+            stageItems.map((item) => (
+              <div
+                key={item.id}
+                className="flex flex-wrap items-center gap-3 border-b p-4 last:border-b-0"
+              >
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-sm font-medium">
+                    {item.item_key}
+                  </p>
+                  <p className="text-muted-foreground text-xs">
+                    {item.stage} · {item.role} · attempt {item.attempt}/
+                    {item.max_attempts}
+                  </p>
+                  {item.error && (
+                    <p className="text-destructive mt-1 text-xs">
+                      {item.error}
+                    </p>
+                  )}
+                </div>
+                <span className="bg-muted rounded-full px-2 py-1 text-xs">
+                  {item.status}
+                </span>
+              </div>
+            ))
+          )}
+        </div>
+      </section>
+      <section className="space-y-3">
         <h2 className="text-xl font-medium">Claim 审计</h2>
         {claims.map((claim) => (
           <article key={claim.id} className="rounded-lg border p-4">
@@ -135,6 +192,28 @@ export default function InvestigationPage() {
           </article>
         ))}
       </section>
+      {auditIssues.length > 0 && (
+        <section className="space-y-3">
+          <h2 className="text-xl font-medium">Audit Issues</h2>
+          {auditIssues.map((issue) => (
+            <article
+              key={issue.id}
+              className="rounded-lg border border-amber-300 p-4"
+            >
+              <div className="flex flex-wrap justify-between gap-2">
+                <span className="font-medium">{issue.rule}</span>
+                <span className="text-sm text-amber-700">
+                  {issue.severity} · {issue.status}
+                </span>
+              </div>
+              <p className="mt-2 text-sm">{issue.reason}</p>
+              <p className="text-muted-foreground mt-2 text-xs">
+                下一步：{issue.required_action}
+              </p>
+            </article>
+          ))}
+        </section>
+      )}
       <section className="space-y-3">
         <h2 className="text-xl font-medium">Evidence Explorer</h2>
         <div className="grid gap-3 md:grid-cols-2">

@@ -1,11 +1,13 @@
 import { fetch } from "@/core/api/fetcher";
 
 import type {
+  AuditIssue,
   Claim,
   Evidence,
   Investigation,
   Report,
   ResearchScope,
+  StageItem,
 } from "./types";
 
 async function json<T>(response: Response): Promise<T> {
@@ -77,12 +79,26 @@ export async function listClaims(id: string): Promise<Claim[]> {
   );
 }
 
+export async function listAuditIssues(id: string): Promise<AuditIssue[]> {
+  return json(
+    await fetch(`/api/investigations/${encodeURIComponent(id)}/audit/issues`),
+  );
+}
+
 export async function getLatestReport(id: string): Promise<Report | null> {
   const response = await fetch(
     `/api/investigations/${encodeURIComponent(id)}/reports/latest`,
   );
   if (response.status === 404) return null;
   return json(response);
+}
+
+export async function listStageItems(id: string): Promise<StageItem[]> {
+  return json(
+    await fetch(
+      `/api/investigations/${encodeURIComponent(id)}/orchestration/items`,
+    ),
+  );
 }
 
 export async function approveReport(

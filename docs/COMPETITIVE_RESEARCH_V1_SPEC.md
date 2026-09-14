@@ -49,15 +49,25 @@ S3-compatible snapshot storage are required before external production rollout.
 
 ## Implemented vertical slice
 
-- Independent fail-fast CI migration chain and 14 `ci_` tables.
+- Independent fail-fast CI migration chain and persistent `ci_stage_items`.
 - Owner-scoped Investigation, Scope, Evidence, Claim, Event and Report APIs.
-- Resumable process worker with Bocha, Tavily, Jina and development-only DDGS.
-- DeepSeek analysis, deterministic two-domain Claim gate and 11-section reports.
+- Lease-fenced workflow recovery with durable task envelopes, submissions, and
+  receipts.
+- Planning/Audit/Synthesis through ordinary DeerFlow Runs; Collect/Analyze and
+  targeted audit rework through Durable Subagent Batches.
+- Bocha, Tavily, Jina and development-only DDGS provider adapters.
+- Deterministic two-domain Claim gate, persisted audit issues, at most two
+  targeted rework rounds, and validated 11-section structured reports.
 - Dedicated workspace with scope/publish approval, rejection/rework, evidence
-  explorer, Claim audit, Markdown download and browser PDF printing.
+  explorer, Claim and audit-issue views, per-Agent item status, Markdown
+  download and browser PDF printing.
 - Production startup rejects missing search or Jina provider credentials.
 
 Before external production rollout, configure the existing DeerFlow database,
 stream bridge, run ownership and run-event settings for PostgreSQL/Redis/DB, and
 provide an S3-compatible implementation for `snapshot_ref`; V1 development
 keeps full extracted excerpts in SQL and leaves `snapshot_ref` optional.
+
+See [Multi-Agent Orchestration](COMPETITIVE_RESEARCH_MULTI_AGENT_ORCHESTRATION.md)
+for scheduling, communication, isolation, validation, retry, and recovery
+semantics.

@@ -405,3 +405,10 @@ sharing the Gateway SQLAlchemy engine/session factory. Migrations run after the
 core DeerFlow bootstrap and fail startup closed. The workflow service controls
 stage transitions; agents and providers may submit evidence/claims but must not
 advance state directly. All repository reads and writes are owner-scoped.
+
+Planning, Audit, and Synthesis run through the ordinary Gateway Run lifecycle;
+Collect, Analyze, and targeted Rework use durable subagent batches. Both paths
+must exchange `StageTask`, `DomainSubmission`, and `AgentReceipt` records through
+`ci_stage_items`. Preserve lease fencing, stable idempotency keys, strict task
+correlation, persisted validated submissions, item-level failure isolation, and
+the initial-plus-two-retries limit when changing this subsystem.

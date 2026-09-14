@@ -16,6 +16,13 @@ def _repo(request: Request) -> InvestigationRepository:
     return repo
 
 
+def _orchestration_repo(request: Request):
+    repo = getattr(request.app.state, "investigation_orchestration_repo", None)
+    if repo is None:
+        raise HTTPException(status_code=503, detail="Competitive Research orchestration is not available")
+    return repo
+
+
 def _user_id() -> str:
     user_id = get_effective_user_id()
     if not user_id:
@@ -33,7 +40,11 @@ def _conflict(exc: Exception) -> HTTPException:
 
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_investigation(body: InvestigationCreate, request: Request):
-    return await _repo(request).create(body, user_id=_user_id())
+    result = await _repo(request).create(body, user_id=_user_id())
+    service = getattr(request.app.state, "investigation_workflow_service", None)
+    if service is not None:
+        service.enqueue(result["id"], _user_id())
+    return result
 
 
 @router.get("")
@@ -104,6 +115,14 @@ async def list_events(investigation_id: str, request: Request, after_seq: int = 
     return result
 
 
+@router.get("/{investigation_id}/orchestration/items")
+async def list_orchestration_items(investigation_id: str, request: Request):
+    result = await _orchestration_repo(request).list_stage_items(investigation_id, user_id=_user_id())
+    if result is None:
+        raise _not_found()
+    return result
+
+
 @router.post("/{investigation_id}/evidence", status_code=status.HTTP_201_CREATED)
 async def submit_evidence(investigation_id: str, body: EvidenceCreate, request: Request):
     try:
@@ -137,6 +156,14 @@ async def submit_claim(investigation_id: str, body: ClaimCreate, request: Reques
 @router.get("/{investigation_id}/claims")
 async def list_claims(investigation_id: str, request: Request):
     result = await _repo(request).list_claims(investigation_id, user_id=_user_id())
+    if result is None:
+        raise _not_found()
+    return result
+
+
+@router.get("/{investigation_id}/audit/issues")
+async def list_audit_issues(investigation_id: str, request: Request, status_filter: str | None = Query(default=None, alias="status")):
+    result = await _repo(request).list_audit_issues(investigation_id, user_id=_user_id(), status=status_filter)
     if result is None:
         raise _not_found()
     return result

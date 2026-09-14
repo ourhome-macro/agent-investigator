@@ -53,6 +53,9 @@ Claim-audit, and report-review UI. Its API client lives in
 `core/investigations/`; keep mutations on the shared authenticated/CSRF
 fetcher. Investigation pages poll durable domain state rather than treating one
 connection as the task, and must preserve explicit `uncertain` Claim labels.
+The detail workspace also renders per-Run/Batch stage items and persisted audit
+issues. Keep protocol/task identifiers diagnostic-only; user actions must use
+owner-scoped API resource IDs.
 
 ```
 Frontend (Next.js) ──▶ LangGraph SDK ──▶ LangGraph Backend (lead_agent)

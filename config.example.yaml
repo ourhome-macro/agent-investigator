@@ -1689,7 +1689,8 @@ subagent_runtime:
 # - live: pending work admitted as queued/running at one time
 # - running: items from one batch allowed to hold real execution slots
 subagent_batches:
-  enabled: false
+  # Competitive Research uses durable batches for collection and analysis.
+  enabled: true
   poll_interval_seconds: 1
   lease_seconds: 120
   max_items_per_batch: 5000

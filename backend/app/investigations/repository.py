@@ -19,6 +19,7 @@ from app.investigations.contracts import (
     ResearchScope,
 )
 from app.investigations.persistence.models import (
+    AuditIssueRow,
     ClaimEvidenceRow,
     ClaimRow,
     CompetitorRow,
@@ -56,7 +57,7 @@ class InvestigationRepository:
                 investigation_type=request.investigation_type.value,
                 title=request.title,
                 brief=request.brief,
-                status=InvestigationStatus.AWAITING_SCOPE_APPROVAL.value,
+                status=InvestigationStatus.PLANNING.value,
                 workflow_version="competitive-research-v1",
                 deadline_at=now + timedelta(minutes=30),
                 created_at=now,
@@ -80,9 +81,9 @@ class InvestigationRepository:
             session.add(
                 InvestigationEventRow(
                     investigation_id=investigation_id,
-                    event_type="ci.stage.completed",
+                    event_type="ci.stage.started",
                     stage="planning",
-                    payload={"next": InvestigationStatus.AWAITING_SCOPE_APPROVAL.value, "scope_version": 1},
+                    payload={"scope_version": 1},
                     created_at=now,
                 )
             )
@@ -113,6 +114,7 @@ class InvestigationRepository:
 
     async def list_recoverable(self) -> list[tuple[str, str]]:
         statuses = [
+            InvestigationStatus.PLANNING.value,
             InvestigationStatus.COLLECTING.value,
             InvestigationStatus.NORMALIZING.value,
             InvestigationStatus.ANALYZING.value,
@@ -139,6 +141,37 @@ class InvestigationRepository:
             await session.execute(CompetitorRow.__table__.delete().where(CompetitorRow.investigation_id == investigation_id))
             session.add_all([CompetitorRow(id=self._id(), investigation_id=investigation_id, canonical_name=name) for name in scope.competitors])
             investigation.updated_at = datetime.now(UTC)
+        return await self.get(investigation_id, user_id=user_id)
+
+    async def complete_planning(self, investigation_id: str, scope: ResearchScope, *, user_id: str, run_id: str | None) -> dict[str, Any] | None:
+        async with self._sf() as session, session.begin():
+            investigation = await session.get(InvestigationRow, investigation_id, with_for_update=True)
+            if investigation is None or investigation.user_id != user_id:
+                return None
+            if investigation.status != InvestigationStatus.PLANNING.value:
+                raise InvestigationConflict("Planning can only complete from planning state")
+            scope_row = (await session.execute(select(ScopeRow).where(ScopeRow.investigation_id == investigation_id).with_for_update())).scalar_one()
+            scope_row.version += 1
+            scope_row.market = scope.market
+            scope_row.audience = scope.audience
+            scope_row.language = scope.language
+            scope_row.time_range = scope.time_range
+            scope_row.dimensions = scope.dimensions
+            scope_row.updated_at = datetime.now(UTC)
+            await session.execute(CompetitorRow.__table__.delete().where(CompetitorRow.investigation_id == investigation_id))
+            session.add_all([CompetitorRow(id=self._id(), investigation_id=investigation_id, canonical_name=name) for name in scope.competitors])
+            require_transition(InvestigationStatus.PLANNING, InvestigationStatus.AWAITING_SCOPE_APPROVAL)
+            investigation.status = InvestigationStatus.AWAITING_SCOPE_APPROVAL.value
+            investigation.updated_at = datetime.now(UTC)
+            session.add(
+                InvestigationEventRow(
+                    investigation_id=investigation_id,
+                    event_type="ci.stage.completed",
+                    stage="planning",
+                    run_id=run_id,
+                    payload={"next": InvestigationStatus.AWAITING_SCOPE_APPROVAL.value, "scope_version": scope_row.version},
+                )
+            )
         return await self.get(investigation_id, user_id=user_id)
 
     async def transition(self, investigation_id: str, target: InvestigationStatus, *, user_id: str, event_type: str, payload: dict[str, Any] | None = None) -> dict[str, Any] | None:
@@ -168,8 +201,6 @@ class InvestigationRepository:
         return await self.get(investigation_id, user_id=user_id)
 
     async def add_evidence(self, investigation_id: str, request: EvidenceCreate, *, user_id: str, agent_name: str | None = None) -> dict[str, Any] | None:
-        if await self.get(investigation_id, user_id=user_id) is None:
-            return None
         components = {
             "source_authority": request.source_authority,
             "freshness": request.freshness,
@@ -202,14 +233,36 @@ class InvestigationRepository:
         )
         try:
             async with self._sf() as session, session.begin():
+                investigation = await session.get(InvestigationRow, investigation_id, with_for_update=True)
+                if investigation is None or investigation.user_id != user_id:
+                    return None
+                if investigation.status not in {
+                    InvestigationStatus.COLLECTING.value,
+                    InvestigationStatus.REWORKING.value,
+                }:
+                    raise InvestigationConflict("Evidence can only be submitted during collecting or reworking")
                 session.add(row)
                 session.add(
                     InvestigationEventRow(
-                        investigation_id=investigation_id, event_type="ci.evidence.accepted" if request.status == EvidenceStatus.ACTIVE else "ci.evidence.rejected", stage="collecting", payload={"evidence_id": row.id, "score": score}
+                        investigation_id=investigation_id,
+                        event_type="ci.evidence.accepted" if request.status == EvidenceStatus.ACTIVE else "ci.evidence.rejected",
+                        stage=investigation.status,
+                        payload={"evidence_id": row.id, "score": score},
                     )
                 )
-        except IntegrityError as exc:
-            raise InvestigationConflict("Evidence content already exists in this investigation") from exc
+        except IntegrityError:
+            async with self._sf() as session:
+                existing = (
+                    await session.execute(
+                        select(EvidenceRow).where(
+                            EvidenceRow.investigation_id == investigation_id,
+                            EvidenceRow.content_hash == request.content_hash,
+                        )
+                    )
+                ).scalar_one_or_none()
+                if existing is not None:
+                    return self._evidence_dict(existing)
+            raise InvestigationConflict("Evidence content already exists in this investigation") from None
         return self._evidence_dict(row)
 
     async def list_evidence(self, investigation_id: str, *, user_id: str) -> list[dict[str, Any]] | None:
@@ -219,12 +272,41 @@ class InvestigationRepository:
             rows = list((await session.execute(select(EvidenceRow).where(EvidenceRow.investigation_id == investigation_id).order_by(EvidenceRow.created_at))).scalars())
             return [self._evidence_dict(row) for row in rows]
 
-    async def add_claim(self, investigation_id: str, request: ClaimCreate, *, user_id: str, agent_name: str | None = None) -> dict[str, Any] | None:
-        if await self.get(investigation_id, user_id=user_id) is None:
-            return None
+    async def add_claim(
+        self,
+        investigation_id: str,
+        request: ClaimCreate,
+        *,
+        user_id: str,
+        agent_name: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any] | None:
         async with self._sf() as session, session.begin():
+            investigation = await session.get(InvestigationRow, investigation_id, with_for_update=True)
+            if investigation is None or investigation.user_id != user_id:
+                return None
+            if investigation.status not in {
+                InvestigationStatus.ANALYZING.value,
+                InvestigationStatus.REWORKING.value,
+            }:
+                raise InvestigationConflict("Claims can only be submitted during analyzing or reworking")
+            if idempotency_key is not None:
+                existing = (await session.execute(select(ClaimRow).where(ClaimRow.idempotency_key == idempotency_key))).scalar_one_or_none()
+                if existing is not None:
+                    links = list((await session.execute(select(ClaimEvidenceRow.evidence_id).where(ClaimEvidenceRow.claim_id == existing.id))).scalars())
+                    return self._claim_dict(existing, links)
             evidence_rows = (
-                list((await session.execute(select(EvidenceRow).where(EvidenceRow.investigation_id == investigation_id, EvidenceRow.id.in_(request.evidence_ids), EvidenceRow.status == EvidenceStatus.ACTIVE.value))).scalars())
+                list(
+                    (
+                        await session.execute(
+                            select(EvidenceRow).where(
+                                EvidenceRow.investigation_id == investigation_id,
+                                EvidenceRow.id.in_(request.evidence_ids),
+                                EvidenceRow.status == EvidenceStatus.ACTIVE.value,
+                            )
+                        )
+                    ).scalars()
+                )
                 if request.evidence_ids
                 else []
             )
@@ -234,6 +316,7 @@ class InvestigationRepository:
             status = ClaimStatus.SUPPORTED if count >= (2 if request.material else 1) else ClaimStatus.UNCERTAIN
             claim = ClaimRow(
                 id=self._id(),
+                idempotency_key=idempotency_key,
                 investigation_id=investigation_id,
                 competitor_id=request.competitor_id,
                 dimension=request.dimension,
@@ -247,8 +330,25 @@ class InvestigationRepository:
             )
             session.add(claim)
             await session.flush()
-            session.add_all([ClaimEvidenceRow(claim_id=claim.id, evidence_id=row.id, relation=ClaimEvidenceRelation.SUPPORTS.value, support_score=row.credibility_score) for row in evidence_rows])
-            session.add(InvestigationEventRow(investigation_id=investigation_id, event_type="ci.claim.created", stage="analyzing", payload={"claim_id": claim.id, "status": status.value, "independent_sources": count}))
+            session.add_all(
+                [
+                    ClaimEvidenceRow(
+                        claim_id=claim.id,
+                        evidence_id=row.id,
+                        relation=ClaimEvidenceRelation.SUPPORTS.value,
+                        support_score=row.credibility_score,
+                    )
+                    for row in evidence_rows
+                ]
+            )
+            session.add(
+                InvestigationEventRow(
+                    investigation_id=investigation_id,
+                    event_type="ci.claim.created",
+                    stage=investigation.status,
+                    payload={"claim_id": claim.id, "status": status.value, "independent_sources": count},
+                )
+            )
         return self._claim_dict(claim, request.evidence_ids)
 
     async def list_claims(self, investigation_id: str, *, user_id: str) -> list[dict[str, Any]] | None:
@@ -261,6 +361,147 @@ class InvestigationRepository:
             for link in links:
                 by_claim.setdefault(link.claim_id, []).append(link.evidence_id)
             return [self._claim_dict(row, by_claim.get(row.id, [])) for row in rows]
+
+    async def supplement_claim_evidence(
+        self,
+        investigation_id: str,
+        claim_id: str,
+        evidence_ids: list[str],
+        *,
+        user_id: str,
+    ) -> dict[str, Any] | None:
+        async with self._sf() as session, session.begin():
+            investigation = await session.get(InvestigationRow, investigation_id, with_for_update=True)
+            if investigation is None or investigation.user_id != user_id:
+                return None
+            if investigation.status != InvestigationStatus.REWORKING.value:
+                raise InvestigationConflict("Claim evidence can only be supplemented during reworking")
+            claim = await session.get(ClaimRow, claim_id, with_for_update=True)
+            if claim is None or claim.investigation_id != investigation_id:
+                raise InvestigationConflict("Claim not found in investigation")
+            evidence_rows = list(
+                (
+                    await session.execute(
+                        select(EvidenceRow).where(
+                            EvidenceRow.investigation_id == investigation_id,
+                            EvidenceRow.id.in_(evidence_ids),
+                            EvidenceRow.status == EvidenceStatus.ACTIVE.value,
+                        )
+                    )
+                ).scalars()
+            )
+            if len(evidence_rows) != len(set(evidence_ids)):
+                raise InvestigationConflict("Claim supplement references missing or inactive evidence")
+            existing_ids = set((await session.execute(select(ClaimEvidenceRow.evidence_id).where(ClaimEvidenceRow.claim_id == claim_id))).scalars())
+            session.add_all(
+                [
+                    ClaimEvidenceRow(
+                        claim_id=claim.id,
+                        evidence_id=row.id,
+                        relation=ClaimEvidenceRelation.SUPPORTS.value,
+                        support_score=row.credibility_score,
+                    )
+                    for row in evidence_rows
+                    if row.id not in existing_ids
+                ]
+            )
+            await session.flush()
+            all_evidence = list(
+                (
+                    await session.execute(
+                        select(EvidenceRow).join(ClaimEvidenceRow, ClaimEvidenceRow.evidence_id == EvidenceRow.id).where(ClaimEvidenceRow.claim_id == claim_id, ClaimEvidenceRow.relation == ClaimEvidenceRelation.SUPPORTS.value)
+                    )
+                ).scalars()
+            )
+            count = independent_source_count(row.source_domain for row in all_evidence)
+            claim.independent_source_count = count
+            claim.status = (ClaimStatus.SUPPORTED if count >= (2 if claim.material else 1) else ClaimStatus.UNCERTAIN).value
+            merged_ids = sorted({row.id for row in all_evidence})
+        return self._claim_dict(claim, merged_ids)
+
+    async def replace_audit_issues(
+        self,
+        investigation_id: str,
+        issues: list[dict[str, Any]],
+        *,
+        user_id: str,
+        raised_by: str,
+    ) -> list[dict[str, Any]] | None:
+        async with self._sf() as session, session.begin():
+            investigation = await session.get(InvestigationRow, investigation_id, with_for_update=True)
+            if investigation is None or investigation.user_id != user_id:
+                return None
+            if investigation.status != InvestigationStatus.AUDITING.value:
+                raise InvestigationConflict("Audit issues can only be submitted during auditing")
+            open_rows = list(
+                (
+                    await session.execute(
+                        select(AuditIssueRow).where(
+                            AuditIssueRow.investigation_id == investigation_id,
+                            AuditIssueRow.status == "open",
+                        )
+                    )
+                ).scalars()
+            )
+            for row in open_rows:
+                row.status = "resolved"
+                row.resolved_by = raised_by
+            created: list[AuditIssueRow] = []
+            for issue in issues:
+                row = AuditIssueRow(
+                    id=self._id(),
+                    investigation_id=investigation_id,
+                    claim_id=issue.get("claim_id"),
+                    section_id=issue.get("section_id"),
+                    severity=str(issue.get("severity") or "warning")[:16],
+                    rule=str(issue.get("rule") or "agent_audit")[:64],
+                    reason=str(issue.get("reason") or "Unspecified audit issue")[:20_000],
+                    required_action=str(issue.get("required_action") or "Collect stronger evidence")[:20_000],
+                    status="open",
+                    raised_by=raised_by,
+                )
+                session.add(row)
+                created.append(row)
+                session.add(
+                    InvestigationEventRow(
+                        investigation_id=investigation_id,
+                        event_type="ci.audit.issue",
+                        stage="auditing",
+                        payload={"issue_id": row.id, "claim_id": row.claim_id, "severity": row.severity, "rule": row.rule},
+                    )
+                )
+        return [self._audit_issue_dict(row) for row in created]
+
+    async def begin_audit_rework(self, investigation_id: str, *, user_id: str, issue_ids: list[str]) -> dict[str, Any] | None:
+        async with self._sf() as session, session.begin():
+            investigation = await session.get(InvestigationRow, investigation_id, with_for_update=True)
+            if investigation is None or investigation.user_id != user_id:
+                return None
+            if investigation.rework_round >= 2:
+                raise InvestigationConflict("Maximum audit rework rounds reached")
+            require_transition(InvestigationStatus(investigation.status), InvestigationStatus.REWORKING)
+            investigation.status = InvestigationStatus.REWORKING.value
+            investigation.rework_round += 1
+            investigation.updated_at = datetime.now(UTC)
+            session.add(
+                InvestigationEventRow(
+                    investigation_id=investigation_id,
+                    event_type="ci.rework.requested",
+                    stage="reworking",
+                    payload={"issue_ids": issue_ids, "round": investigation.rework_round, "source": "evidence_audit"},
+                )
+            )
+        return await self.get(investigation_id, user_id=user_id)
+
+    async def list_audit_issues(self, investigation_id: str, *, user_id: str, status: str | None = None) -> list[dict[str, Any]] | None:
+        if await self.get(investigation_id, user_id=user_id) is None:
+            return None
+        async with self._sf() as session:
+            statement = select(AuditIssueRow).where(AuditIssueRow.investigation_id == investigation_id)
+            if status is not None:
+                statement = statement.where(AuditIssueRow.status == status)
+            rows = list((await session.execute(statement.order_by(AuditIssueRow.created_at))).scalars())
+            return [self._audit_issue_dict(row) for row in rows]
 
     async def list_events(self, investigation_id: str, *, user_id: str, after_seq: int = 0, limit: int = 500) -> list[dict[str, Any]] | None:
         if await self.get(investigation_id, user_id=user_id) is None:
@@ -457,4 +698,21 @@ class InvestigationRepository:
             "evidence_ids": evidence_ids,
             "status": row.status,
             "independent_source_count": row.independent_source_count,
+        }
+
+    @staticmethod
+    def _audit_issue_dict(row: AuditIssueRow) -> dict[str, Any]:
+        return {
+            "id": row.id,
+            "investigation_id": row.investigation_id,
+            "claim_id": row.claim_id,
+            "section_id": row.section_id,
+            "severity": row.severity,
+            "rule": row.rule,
+            "reason": row.reason,
+            "required_action": row.required_action,
+            "status": row.status,
+            "raised_by": row.raised_by,
+            "resolved_by": row.resolved_by,
+            "created_at": row.created_at,
         }

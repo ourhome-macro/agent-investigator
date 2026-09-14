@@ -4,12 +4,17 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
+import socket
+import uuid
 from datetime import UTC, datetime
 from typing import Any
 
 from fastapi.encoders import jsonable_encoder
 
-from app.investigations.contracts import ClaimCreate, EvidenceCreate, InvestigationStatus
+from app.investigations.contracts import ClaimCreate, EvidenceCreate, InvestigationStatus, ResearchScope
+from app.investigations.orchestration_repository import OrchestrationRepository, WorkflowLeaseLost
+from app.investigations.orchestrator import DurableCompetitiveOrchestrator
 from app.investigations.providers import ResearchProviderRegistry, canonicalize_url
 from app.investigations.repository import InvestigationConflict, InvestigationRepository
 from deerflow.config import get_app_config
@@ -21,23 +26,44 @@ logger = logging.getLogger(__name__)
 class InvestigationWorkflowService:
     """Process-local worker for V1; durable state makes startup recovery safe."""
 
-    def __init__(self, repository: InvestigationRepository, providers: ResearchProviderRegistry | None = None) -> None:
+    def __init__(
+        self,
+        repository: InvestigationRepository,
+        providers: ResearchProviderRegistry | None = None,
+        *,
+        orchestration_repository: OrchestrationRepository | None = None,
+        durable_orchestrator: DurableCompetitiveOrchestrator | None = None,
+        owner_id: str | None = None,
+    ) -> None:
         self._repo = repository
         self._providers = providers or ResearchProviderRegistry()
         self._providers.validate_startup()
+        self._orchestration = orchestration_repository
+        self._durable_orchestrator = durable_orchestrator
+        self._owner_id = owner_id or f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+        self._lease_seconds = 120
         self._queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue(maxsize=100)
         self._active: set[str] = set()
         self._worker: asyncio.Task[None] | None = None
 
     @property
     def provider_status(self) -> dict[str, bool]:
-        return self._providers.status()
+        return {
+            **self._providers.status(),
+            "durable_orchestration": self._durable_orchestrator is not None,
+        }
 
     async def start(self) -> None:
         if self._worker is None:
             self._worker = asyncio.create_task(self._run_loop(), name="competitive-research-worker")
-            for investigation_id, user_id in await self._repo.list_recoverable():
-                self.enqueue(investigation_id, user_id)
+            if self._orchestration is not None:
+                for workflow in await self._orchestration.recoverable_workflows():
+                    self.enqueue(workflow["investigation_id"], workflow["user_id"])
+                for investigation_id, user_id in await self._repo.list_recoverable():
+                    self.enqueue(investigation_id, user_id)
+            else:
+                for investigation_id, user_id in await self._repo.list_recoverable():
+                    self.enqueue(investigation_id, user_id)
 
     async def stop(self) -> None:
         if self._worker is not None:
@@ -60,9 +86,53 @@ class InvestigationWorkflowService:
         while True:
             investigation_id, user_id = await self._queue.get()
             try:
-                await self._execute(investigation_id, user_id)
+                if self._orchestration is not None and self._durable_orchestrator is not None:
+                    investigation = await self._repo.get(investigation_id, user_id=user_id)
+                    if investigation is None:
+                        continue
+                    workflow = await self._orchestration.ensure_workflow(
+                        investigation_id,
+                        user_id=user_id,
+                        idempotency_key=(f"{investigation_id}:planning" if investigation["status"] == InvestigationStatus.PLANNING.value else f"{investigation_id}:execution:round:{investigation['rework_round']}"),
+                    )
+                    claimed = await self._orchestration.claim_workflow(
+                        workflow["id"],
+                        owner_id=self._owner_id,
+                        lease_seconds=self._lease_seconds,
+                    )
+                    if claimed is None:
+                        continue
+                    heartbeat = asyncio.create_task(self._heartbeat(workflow["id"]), name=f"ci-heartbeat-{workflow['id']}")
+                    execution = asyncio.create_task(
+                        self._durable_orchestrator.execute(claimed, user_id=user_id),
+                        name=f"ci-workflow-{workflow['id']}",
+                    )
+                    try:
+                        done, _ = await asyncio.wait({execution, heartbeat}, return_when=asyncio.FIRST_COMPLETED)
+                        if heartbeat in done:
+                            execution.cancel()
+                            await asyncio.gather(execution, return_exceptions=True)
+                            heartbeat.result()
+                            raise WorkflowLeaseLost("Competitive Research heartbeat stopped unexpectedly")
+                        await execution
+                        finalized = await self._orchestration.finalize_workflow(workflow["id"], owner_id=self._owner_id, succeeded=True)
+                        if not finalized:
+                            raise WorkflowLeaseLost("Workflow completed after its lease was lost")
+                    except Exception:
+                        await self._orchestration.finalize_workflow(workflow["id"], owner_id=self._owner_id, succeeded=False)
+                        raise
+                    finally:
+                        if not execution.done():
+                            execution.cancel()
+                            await asyncio.gather(execution, return_exceptions=True)
+                        heartbeat.cancel()
+                        await asyncio.gather(heartbeat, return_exceptions=True)
+                else:
+                    await self._execute(investigation_id, user_id)
             except asyncio.CancelledError:
                 raise
+            except WorkflowLeaseLost:
+                logger.warning("Competitive Research workflow lease lost; a recovery worker may continue: %s", investigation_id)
             except Exception as exc:
                 logger.exception("Competitive Research workflow failed: %s", investigation_id)
                 try:
@@ -73,9 +143,28 @@ class InvestigationWorkflowService:
                 self._active.discard(investigation_id)
                 self._queue.task_done()
 
+    async def _heartbeat(self, workflow_run_id: str) -> None:
+        while True:
+            await asyncio.sleep(self._lease_seconds / 3)
+            renewed = await self._orchestration.renew_workflow_lease(
+                workflow_run_id,
+                owner_id=self._owner_id,
+                lease_seconds=self._lease_seconds,
+            )
+            if not renewed:
+                raise WorkflowLeaseLost("Competitive Research workflow lease was lost")
+
     async def _execute(self, investigation_id: str, user_id: str) -> None:
         investigation = await self._repo.get(investigation_id, user_id=user_id)
         if investigation is None:
+            return
+        if investigation["status"] == InvestigationStatus.PLANNING.value:
+            await self._repo.complete_planning(
+                investigation_id,
+                ResearchScope.model_validate(investigation["scope"]),
+                user_id=user_id,
+                run_id=None,
+            )
             return
         if investigation["status"] == InvestigationStatus.COLLECTING.value:
             competitors = await self._repo.list_competitors(investigation_id, user_id=user_id) or []

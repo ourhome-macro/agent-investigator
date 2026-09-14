@@ -9,8 +9,9 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.investigations.contracts import ClaimCreate, EvidenceCreate, InvestigationCreate, InvestigationStatus, InvestigationType, ResearchScope
 from app.investigations.persistence import upgrade_investigation_schema
+from app.investigations.protocols import DomainSubmission, StageName, StageTask, SubmissionKind, parse_domain_submission, render_stage_prompt
 from app.investigations.providers import ResearchProviderRegistry, SearchHit, canonicalize_url
-from app.investigations.repository import InvestigationRepository
+from app.investigations.repository import InvestigationConflict, InvestigationRepository
 from app.investigations.scoring import claim_is_supported, credibility_score, independent_source_count
 from app.investigations.service import InvestigationWorkflowService
 from app.investigations.state_machine import InvalidInvestigationTransition, require_transition
@@ -67,7 +68,8 @@ async def test_independent_migration_and_repository_round_trip(tmp_path) -> None
 
         assert "ci_investigations" in tables
         assert "ci_claim_evidence" in tables
-        assert version == "ci_0001"
+        assert "ci_stage_items" in tables
+        assert version == "ci_0005"
 
         repository = InvestigationRepository(async_sessionmaker(engine, expire_on_commit=False))
         created = await repository.create(
@@ -79,9 +81,35 @@ async def test_independent_migration_and_repository_round_trip(tmp_path) -> None
             ),
             user_id="user-1",
         )
-        assert created["status"] == InvestigationStatus.AWAITING_SCOPE_APPROVAL.value
+        assert created["status"] == InvestigationStatus.PLANNING.value
         assert created["scope"]["competitors"] == ["Acme", "Beta"]
         assert await repository.get(created["id"], user_id="other-user") is None
+        with pytest.raises(InvestigationConflict, match="Evidence can only"):
+            await repository.add_evidence(
+                created["id"],
+                EvidenceCreate(
+                    source_url="https://example.com/too-early",
+                    canonical_url="https://example.com/too-early",
+                    source_domain="example.com",
+                    title="Too early",
+                    retrieved_at=datetime.now(UTC),
+                    excerpt="This evidence must not be accepted before the scope approval stage has completed.",
+                    content_hash="f" * 64,
+                    source_authority=10,
+                    freshness=10,
+                    extraction_quality=5,
+                    specificity=5,
+                    corroboration=0,
+                ),
+                user_id="user-1",
+            )
+        await repository.complete_planning(
+            created["id"],
+            ResearchScope(competitors=["Acme", "Beta"]),
+            user_id="user-1",
+            run_id="planning-run-1",
+        )
+        await repository.approve_scope(created["id"], user_id="user-1", idempotency_key="approve-scope-1")
 
         evidence_ids = []
         for index, domain in enumerate(("acme.com", "industry.example")):
@@ -105,6 +133,18 @@ async def test_independent_migration_and_repository_round_trip(tmp_path) -> None
             )
             assert evidence is not None
             evidence_ids.append(evidence["id"])
+        await repository.transition(
+            created["id"],
+            InvestigationStatus.NORMALIZING,
+            user_id="user-1",
+            event_type="ci.stage.completed",
+        )
+        await repository.transition(
+            created["id"],
+            InvestigationStatus.ANALYZING,
+            user_id="user-1",
+            event_type="ci.stage.started",
+        )
         claim = await repository.add_claim(
             created["id"],
             ClaimCreate(dimension="pricing", text="Acme has an enterprise pricing tier.", evidence_ids=evidence_ids),
@@ -113,12 +153,94 @@ async def test_independent_migration_and_repository_round_trip(tmp_path) -> None
         assert claim is not None
         assert claim["status"] == "supported"
         assert claim["independent_source_count"] == 2
+
+        uncertain = await repository.add_claim(
+            created["id"],
+            ClaimCreate(
+                dimension="pricing",
+                text="Acme has documented enterprise pricing.",
+                material=True,
+                evidence_ids=[evidence_ids[0]],
+            ),
+            user_id="user-1",
+            agent_name="pricing-analyst",
+            idempotency_key="analysis-task-1:claim:0",
+        )
+        assert uncertain is not None and uncertain["status"] == "uncertain"
+        replayed = await repository.add_claim(
+            created["id"],
+            ClaimCreate(
+                dimension="pricing",
+                text="This changed replay payload must not create another Claim.",
+                material=True,
+                evidence_ids=[evidence_ids[0]],
+            ),
+            user_id="user-1",
+            agent_name="pricing-analyst",
+            idempotency_key="analysis-task-1:claim:0",
+        )
+        assert replayed is not None and replayed["id"] == uncertain["id"]
+        await repository.transition(
+            created["id"],
+            InvestigationStatus.AUDITING,
+            user_id="user-1",
+            event_type="ci.stage.started",
+        )
+        issues = await repository.replace_audit_issues(
+            created["id"],
+            [
+                {
+                    "claim_id": uncertain["id"],
+                    "severity": "warning",
+                    "rule": "semantic_support",
+                    "reason": "Excerpt is indirect.",
+                    "required_action": "Collect an official pricing page.",
+                }
+            ],
+            user_id="user-1",
+            raised_by="evidence-auditor",
+        )
+        assert issues is not None and issues[0]["status"] == "open"
+        assert len(await repository.list_audit_issues(created["id"], user_id="user-1", status="open") or []) == 1
+        await repository.begin_audit_rework(created["id"], user_id="user-1", issue_ids=[issues[0]["id"]])
+        supplemented = await repository.supplement_claim_evidence(created["id"], uncertain["id"], [evidence_ids[1]], user_id="user-1")
+        assert supplemented is not None and supplemented["status"] == "supported"
     finally:
         await engine.dispose()
 
 
 def test_canonical_url_removes_tracking_and_fragment() -> None:
     assert canonicalize_url("HTTPS://Example.COM/path?utm_source=x&id=1#part") == "https://example.com/path?id=1"
+
+
+def test_stage_protocol_requires_exact_task_correlation() -> None:
+    task = StageTask(
+        task_id="task-0001",
+        investigation_id="investigation-0001",
+        workflow_run_id="workflow-0001",
+        stage=StageName.COLLECTING,
+        item_key="acme:pricing",
+        role="competitor-collector",
+        idempotency_key="workflow-0001:acme:pricing",
+        input={"competitor": "Acme", "dimension": "pricing"},
+    )
+    submission = DomainSubmission(
+        task_id=task.task_id,
+        investigation_id=task.investigation_id,
+        workflow_run_id=task.workflow_run_id,
+        stage=task.stage,
+        item_key=task.item_key,
+        kind=SubmissionKind.EVIDENCE,
+        payload={"evidence": []},
+    )
+    submission.require_matches(task)
+    parsed = parse_domain_submission(submission.model_dump_json())
+    parsed.require_matches(task)
+    assert "<stage-task>" in render_stage_prompt(task, "Collect evidence.")
+
+    mismatched = submission.model_copy(update={"item_key": "other"})
+    with pytest.raises(ValueError, match="item_key"):
+        mismatched.require_matches(task)
 
 
 @pytest.mark.asyncio
@@ -165,6 +287,12 @@ async def test_workflow_reaches_report_review_with_auditable_claims(tmp_path, mo
         created = await repository.create(
             InvestigationCreate(title="Acme vs Beta", brief="Compare product capability and pricing for strategy.", scope=ResearchScope(competitors=["Acme", "Beta"], dimensions=["功能"])),
             user_id="user-1",
+        )
+        await repository.complete_planning(
+            created["id"],
+            ResearchScope(competitors=["Acme", "Beta"], dimensions=["功能"]),
+            user_id="user-1",
+            run_id="planning-run-1",
         )
         await repository.approve_scope(created["id"], user_id="user-1", idempotency_key="approve-0001")
         service = InvestigationWorkflowService(repository, Providers())

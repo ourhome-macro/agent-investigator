@@ -88,6 +88,34 @@ class StageAttemptRow(InvestigationBase):
     __table_args__ = (UniqueConstraint("workflow_run_id", "stage", "attempt", name="uq_ci_stage_attempt"),)
 
 
+class StageItemRow(InvestigationBase):
+    __tablename__ = "ci_stage_items"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    task_id: Mapped[str] = mapped_column(String(128), index=True)
+    workflow_run_id: Mapped[str] = mapped_column(ForeignKey("ci_workflow_runs.id", ondelete="CASCADE"), index=True)
+    stage_attempt_id: Mapped[str] = mapped_column(ForeignKey("ci_stage_attempts.id", ondelete="CASCADE"), index=True)
+    stage: Mapped[str] = mapped_column(String(48), index=True)
+    item_key: Mapped[str] = mapped_column(String(128))
+    role: Mapped[str] = mapped_column(String(128))
+    status: Mapped[str] = mapped_column(String(24), index=True)
+    attempt: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=3)
+    task_envelope: Mapped[dict] = mapped_column(JSON)
+    submission: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    receipt: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    durable_batch_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    durable_batch_item_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
+    __table_args__ = (
+        UniqueConstraint("stage_attempt_id", "item_key", name="uq_ci_stage_item_key"),
+        Index("ix_ci_stage_item_workflow_stage", "workflow_run_id", "stage", "status"),
+    )
+
+
 class EvidenceRow(InvestigationBase):
     __tablename__ = "ci_evidence"
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -117,6 +145,7 @@ class EvidenceRow(InvestigationBase):
 class ClaimRow(InvestigationBase):
     __tablename__ = "ci_claims"
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(180), nullable=True, unique=True, index=True)
     investigation_id: Mapped[str] = mapped_column(ForeignKey("ci_investigations.id", ondelete="CASCADE"), index=True)
     competitor_id: Mapped[str | None] = mapped_column(ForeignKey("ci_competitors.id", ondelete="SET NULL"), nullable=True)
     dimension: Mapped[str] = mapped_column(String(64), index=True)

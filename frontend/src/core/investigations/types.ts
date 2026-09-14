@@ -60,10 +60,48 @@ export interface Claim {
   independent_source_count: number;
 }
 
+export interface AuditIssue {
+  id: string;
+  claim_id: string | null;
+  section_id: string | null;
+  severity: "info" | "warning" | "error";
+  rule: string;
+  reason: string;
+  required_action: string;
+  status: "open" | "resolved" | "waived";
+}
+
 export interface Report {
   id: string;
   version: number;
   status: string;
   rendered_markdown: string;
   created_at: string;
+}
+
+export interface StageItem {
+  id: string;
+  task_id: string;
+  workflow_run_id: string;
+  stage_attempt_id: string;
+  stage: string;
+  item_key: string;
+  role: string;
+  status:
+    | "pending"
+    | "running"
+    | "succeeded"
+    | "failed"
+    | "rejected"
+    | "cancelled";
+  attempt: number;
+  max_attempts: number;
+  durable_batch_id: string | null;
+  durable_batch_item_id: string | null;
+  error: string | null;
+  receipt: {
+    model_name?: string | null;
+    token_usage?: Record<string, unknown> | null;
+    warnings?: string[];
+  } | null;
 }

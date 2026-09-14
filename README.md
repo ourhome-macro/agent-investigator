@@ -1670,6 +1670,10 @@ review, and Markdown/browser-PDF delivery. The domain API is mounted at
 `/api/investigations`; its independent `alembic_version_ci` migration chain is
 applied after core DeerFlow migrations and fails startup closed.
 
+Planning, evidence audit, and synthesis use ordinary DeerFlow Runs. Collection,
+analysis, and targeted evidence rework use durable subagent batches with
+item-level failure isolation and restart recovery.
+
 Development may fall back to DDGS. Production research requires at least
 `BOCHA_API_KEY` or `TAVILY_API_KEY`; `JINA_API_KEY` enables full-page extraction.
 See [Competitive Research V1](docs/COMPETITIVE_RESEARCH_V1_SPEC.md).
