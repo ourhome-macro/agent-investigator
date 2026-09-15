@@ -138,7 +138,7 @@ class InvestigationWorkflowService:
                         heartbeat.cancel()
                         await asyncio.gather(heartbeat, return_exceptions=True)
                 else:
-                    await self._execute(investigation_id, user_id)
+                    raise RuntimeError("Competitive Research requires durable subagent batches; enable subagent_batches.enabled")
             except asyncio.CancelledError:
                 raise
             except WorkflowLeaseLost:

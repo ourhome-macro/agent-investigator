@@ -7,6 +7,7 @@ class TokenBudgetConfig(BaseModel):
     """Configuration for per-run token budget enforcement."""
 
     enabled: bool = Field(default=False, description="Whether to enable per-run token budget enforcement.")
+    preflight: bool = Field(default=False, description="Reserve a conservative text input bound and cap completion tokens before each model call; unknown usage remains charged.")
     max_tokens: int = Field(default=200000, ge=1000, description="Maximum total tokens (input + output) allowed per run.")
     max_input_tokens: int | None = Field(default=None, ge=1, description="Optional separate limit for input tokens only.")
     max_output_tokens: int | None = Field(default=None, ge=1, description="Optional separate limit for output tokens only.")

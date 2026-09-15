@@ -38,6 +38,7 @@ def test_production_infrastructure_accepts_postgres_redis_db_events_and_s3(monke
     monkeypatch.setenv("CI_EMBEDDING_MODEL", "embedding-model")
     config = SimpleNamespace(
         database=SimpleNamespace(backend="postgres"),
+        subagent_batches=SimpleNamespace(enabled=True),
         run_events=SimpleNamespace(backend="db"),
         stream_bridge=SimpleNamespace(type="redis"),
     )

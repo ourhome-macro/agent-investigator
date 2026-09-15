@@ -8,6 +8,8 @@ def validate_production_infrastructure(config: Any) -> None:
     if os.getenv("DEER_FLOW_ENV", "development").lower() != "production":
         return
     failures: list[str] = []
+    if not getattr(getattr(config, "subagent_batches", None), "enabled", False):
+        failures.append("subagent_batches.enabled must be true")
     if getattr(getattr(config, "database", None), "backend", None) != "postgres":
         failures.append("database.backend must be postgres")
     if getattr(getattr(config, "run_events", None), "backend", None) != "db":

@@ -40,6 +40,8 @@ class ClaimStatus(StrEnum):
     SUPPORTED = "supported"
     CONTRADICTED = "contradicted"
     UNCERTAIN = "uncertain"
+    SUPERSEDED = "superseded"
+    REJECTED = "rejected"
 
 
 class ClaimEvidenceRelation(StrEnum):
@@ -68,6 +70,8 @@ class ResearchScope(BaseModel):
     competitors: list[str] = Field(min_length=2, max_length=5)
     dimensions: list[str] = Field(default_factory=lambda: ["功能", "定价", "定位", "用户", "壁垒"], min_length=1, max_length=12)
     official_domains: dict[str, list[str]] = Field(default_factory=dict)
+    official_repositories: dict[str, list[str]] = Field(default_factory=dict)
+    required_dimensions: list[str] = Field(default_factory=list, max_length=12)
 
     @field_validator("competitors", "dimensions")
     @classmethod
@@ -85,6 +89,9 @@ class ResearchScope(BaseModel):
             raise ValueError("Scope requires 2-5 unique competitors")
         if not self.dimensions:
             raise ValueError("Scope requires at least one research dimension")
+        self.required_dimensions = list(dict.fromkeys(value.strip() for value in self.required_dimensions))
+        if set(self.required_dimensions) - set(self.dimensions):
+            raise ValueError("Required dimensions must belong to the research dimensions")
         competitor_names = {name.casefold() for name in self.competitors}
         if any(name.casefold() not in competitor_names for name in self.official_domains):
             raise ValueError("official_domains keys must match scoped competitors")
@@ -97,8 +104,33 @@ class ResearchScope(BaseModel):
                 hostname = (parsed.hostname or "").removeprefix("www.")
                 if "." in hostname:
                     normalized.add(hostname)
-            normalized_domains[name] = sorted(normalized)
+            canonical_name = next(item for item in self.competitors if item.casefold() == name.casefold())
+            normalized_domains[canonical_name] = sorted(normalized)
         self.official_domains = normalized_domains
+        if any(name.casefold() not in competitor_names for name in self.official_repositories):
+            raise ValueError("official_repositories keys must match scoped competitors")
+        normalized_repositories = {}
+        for name, repositories in self.official_repositories.items():
+            urls = set()
+            for repository in repositories:
+                parsed = urlsplit(repository.strip())
+                parts = [part for part in parsed.path.split("/") if part]
+                if (
+                    parsed.scheme != "https"
+                    or parsed.hostname not in {"github.com", "gitlab.com", "gitee.com"}
+                    or parsed.username
+                    or parsed.password
+                    or parsed.port
+                    or parsed.query
+                    or parsed.fragment
+                    or len(parts) != 2
+                    or any(part in {".", ".."} for part in parts)
+                ):
+                    raise ValueError("Official repositories must be HTTPS repository-root URLs, e.g. https://github.com/owner/repo")
+                urls.add(f"https://{parsed.hostname}/{'/'.join(parts)}")
+            canonical_name = next(item for item in self.competitors if item.casefold() == name.casefold())
+            normalized_repositories[canonical_name] = sorted(urls)
+        self.official_repositories = normalized_repositories
         return self
 
 
@@ -202,6 +234,25 @@ class PriceObservationCreate(BaseModel):
     snapshot_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
+class AtomicStatement(BaseModel):
+    subject: str = Field(min_length=1, max_length=200)
+    predicate: str = Field(min_length=1, max_length=80)
+    object: str = Field(min_length=1, max_length=1000)
+    conditions: str = Field(default="", max_length=500)
+
+    @field_validator("predicate")
+    @classmethod
+    def single_predicate(cls, value: str) -> str:
+        import re
+
+        if re.search(r"[;；\n]|\b(?:and|also|therefore)\b|并且|同时|因此", value, re.IGNORECASE):
+            raise ValueError("Split compound predicates into separate atomic claims")
+        return value.strip()
+
+    def render(self) -> str:
+        return " ".join([self.subject, self.predicate, self.object]) + (f" ({self.conditions})" if self.conditions else "")
+
+
 class ClaimCreate(BaseModel):
     competitor_id: str | None = None
     dimension: str = Field(min_length=1, max_length=64)
@@ -217,7 +268,7 @@ class ClaimCreate(BaseModel):
         binding_ids = [binding.evidence_id for binding in self.evidence_bindings]
         if len(binding_ids) != len(set(binding_ids)):
             raise ValueError("Claim evidence bindings must reference unique Evidence IDs")
-        if self.claim_type == "fact" and not self.evidence_bindings:
+        if self.claim_type in {"fact", "pricing", "vendor_statement", "user_report"} and not self.evidence_bindings:
             raise ValueError("Factual claims require at least one verbatim Evidence binding")
         self.evidence_ids = binding_ids
         price_evidence = {item.evidence_id for item in self.price_observations}
@@ -231,6 +282,7 @@ class ClaimView(ClaimCreate):
     investigation_id: str
     status: ClaimStatus
     independent_source_count: int
+    support_basis: str = "unverified"
 
 
 class InvestigationEvent(BaseModel):

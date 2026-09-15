@@ -47,6 +47,9 @@ Extensions are optional only in the fallback *search* mode (priority 3-4 above):
 ### Config Schema
 
 **`config.yaml`** key sections:
+- `token_budget.preflight` - Optional conservative text-input reservation and
+  completion cap before dispatch. Defaults false; isolated budgeted research
+  tasks explicitly enable it. Config schema version 41 introduces this field.
 - `models[]` - LLM configs with `use` class path, `supports_thinking`, `supports_vision`, provider-specific fields
 - `logging.enhance` - Log output only (`enabled`, `format`): whether log records carry a `trace_id` field, and in which format. Trace ids are issued unconditionally — the Gateway `X-Trace-Id` header and Langfuse `deerflow_trace_id` metadata are always present whatever this says (see the Request Trace Context section in `packages/harness/deerflow/AGENTS.md`); restart-required
 - vLLM reasoning models should use `deerflow.models.vllm_provider:VllmChatModel`; for Qwen-style parsers prefer `when_thinking_enabled.extra_body.chat_template_kwargs.enable_thinking`, and DeerFlow will also normalize the older `thinking` alias

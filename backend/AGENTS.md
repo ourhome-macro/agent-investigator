@@ -431,3 +431,43 @@ Agent context, isolate ordinary Runs by StageTask thread, and keep technical
 DomainSubmission may be routed by the adapter through the same domain handler
 when a model omits the tool call. Failed/budget-exhausted work may produce only
 a `partial=true` uncertainty report and must not upgrade unaudited Claims.
+
+Research control-loop v2 uses `quality.py` for candidate admission, coverage and
+grounded report rendering. Candidate full text and admission provenance are
+persisted in `ci_candidates` before Collector execution; model excerpts must
+match that retained snapshot. Analysis is competitor-scoped and submits atomic
+subject/predicate/object/conditions. Audit uses chunks of at most four claims;
+retry counts belong to the protocol task, not all tasks sharing a stage name.
+Open issues cannot disappear on replacement; explicit version-bound resolution
+is required. Claim retirement preserves old rows and journals replacement IDs.
+The report model selects eligible Claim IDs and labelled hypotheses; it cannot
+submit free-form factual Markdown. Publication rechecks claim versions and issues.
+
+`ci_0010` adds candidates and durable budget reservations. Reserve a whole stage
+atomically before dispatch, retain ambiguous usage, and settle after receipts.
+Research batches use one execution attempt; workflow recovery/rework reserves
+new capacity. Ordinary Runs retain initial-plus-two attempts per task. The
+Gateway's internal-only `token_budget_max_tokens` and `bounded_tool_names` keys
+must be stripped from both external context feeds. Text preflight uses a
+conservative UTF-8 input bound and output caps; native SDK retries are disabled
+for models exposing max_retries. Budgeted isolated tasks disable auxiliary
+memory/summarization calls. A missing durable runtime must not activate the
+legacy non-durable research path.
+
+Source-aware confidence (`confidence.py`, migration `ci_0011`) is authoritative
+for Claim sufficiency. Full-text quote/hash/value/entailment checks remain
+mandatory. A confirmed official source can support a narrowly attributed
+product statement; vendor statements and individual user reports retain their
+own `support_basis` and cannot masquerade as independently corroborated facts.
+Shared Git hosting domains alone do not establish ownership: Scope approval
+must name an `official_repositories` root; community/Issue pages are excluded
+from official-document treatment. `material` no longer determines a universal
+two-domain requirement. Include Claim type in semantic deduplication.
+
+Only blocking Issues stop the affected Claim; non-blocking notes do not cause
+global exclusion or automatic rework. Required dimensions and competitors with
+no product facts drive further collection. Completion, coverage and source
+levels are separate: `completed_with_gaps` is publishable when core requirements
+are met; absent opportunity hypotheses alone are not failure. Publication must
+re-evaluate the same policy and source-level snapshot. Keep user-visible
+explanations separate from protocol identifiers and original diagnostic errors.

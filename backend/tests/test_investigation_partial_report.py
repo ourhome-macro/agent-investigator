@@ -31,6 +31,6 @@ def test_partial_report_preserves_uncertainty_and_all_evidence() -> None:
     ]
     structured, markdown = build_partial_report(investigation, claims, evidence, [])
     assert structured["partial"] is True
-    assert len(structured["sections"]) == 11
-    assert "[uncertain]" in markdown
+    assert len(structured["sections"]) == 5
+    assert "[待核实]" in markdown
     assert "https://example.com/source" in markdown

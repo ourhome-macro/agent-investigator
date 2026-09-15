@@ -6,6 +6,10 @@ import { useEffect, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { listInvestigations, type Investigation } from "@/core/investigations";
+import {
+  readableError,
+  researchStageLabel,
+} from "@/core/investigations/quality";
 
 export default function InvestigationsPage() {
   const [items, setItems] = useState<Investigation[]>([]);
@@ -23,10 +27,10 @@ export default function InvestigationsPage() {
     <main className="mx-auto w-full max-w-6xl space-y-8 p-6 md:p-10">
       <header className="flex items-center justify-between gap-4">
         <div>
-          <p className="text-muted-foreground text-sm">Deep Research Agent</p>
+          <p className="text-muted-foreground text-sm">研究工作台</p>
           <h1 className="text-3xl font-semibold">竞品深度调研</h1>
           <p className="text-muted-foreground mt-2">
-            每个事实结论都关联证据，开题和发布均需人工批准。
+            比较产品、核对原始资料，分清已知事实、来源说法和信息缺口。开始研究和发布报告前，都由你确认。
           </p>
         </div>
         <Button asChild>
@@ -38,7 +42,7 @@ export default function InvestigationsPage() {
       </header>
       {error && (
         <div className="border-destructive/30 bg-destructive/10 text-destructive rounded-lg border p-4">
-          {error}
+          {readableError(error)}
         </div>
       )}
       <section className="grid gap-4 md:grid-cols-2">
@@ -51,7 +55,7 @@ export default function InvestigationsPage() {
             <div className="flex items-start justify-between gap-3">
               <FlaskConical className="text-primary size-5" />
               <span className="bg-muted rounded-full px-2 py-1 text-xs">
-                {item.status}
+                {researchStageLabel(item.status)}
               </span>
             </div>
             <h2 className="mt-4 text-lg font-medium">{item.title}</h2>

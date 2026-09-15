@@ -22,6 +22,8 @@ export interface ResearchScope {
   competitors: string[];
   dimensions: string[];
   official_domains?: Record<string, string[]>;
+  official_repositories?: Record<string, string[]>;
+  required_dimensions?: string[];
   version?: number;
   approved_at?: string | null;
 }
@@ -37,6 +39,7 @@ export interface Investigation {
   rework_round: number;
   failure_retry_count: number;
   token_used: number;
+  token_reserved?: number;
   token_budget: number;
   deadline_at: string | null;
   created_at: string;
@@ -51,6 +54,8 @@ export interface Evidence {
   source_domain: string;
   excerpt: string;
   credibility_score: number;
+  retrieved_at?: string;
+  published_at?: string | null;
   status: string;
 }
 
@@ -70,7 +75,21 @@ export interface Claim {
     validation_status: string;
     entailment_status: string | null;
   }>;
-  status: "supported" | "contradicted" | "uncertain";
+  status:
+    | "supported"
+    | "contradicted"
+    | "uncertain"
+    | "superseded"
+    | "rejected";
+  publication_eligible?: boolean;
+  support_basis?:
+    | "corroborated"
+    | "official_documented"
+    | "vendor_stated"
+    | "user_reported"
+    | "unverified"
+    | "legacy_unverified";
+  display_text?: string;
   independent_source_count: number;
 }
 
@@ -97,6 +116,7 @@ export interface AuditIssue {
   reason: string;
   required_action: string;
   status: "open" | "resolved" | "waived";
+  blocking?: boolean;
 }
 
 export interface Report {
@@ -105,6 +125,19 @@ export interface Report {
   status: string;
   rendered_markdown: string;
   created_at: string;
+  structured_data?: {
+    partial?: boolean;
+    completion_status?: "incomplete" | "completed" | "completed_with_gaps";
+    coverage_status?: "complete" | "has_gaps";
+  };
+}
+
+export interface CoverageCell {
+  competitor_id: string;
+  competitor: string;
+  dimension: string;
+  status: "covered" | "partial" | "missing";
+  claim_ids: string[];
 }
 
 export interface StageItem {
@@ -114,6 +147,7 @@ export interface StageItem {
   stage_attempt_id: string;
   stage: string;
   item_key: string;
+  subject_label?: string;
   role: string;
   status:
     | "pending"

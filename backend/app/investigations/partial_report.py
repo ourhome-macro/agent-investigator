@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.investigations.confidence import POLICY_VERSION, claim_display_text, issue_summary
+from app.investigations.quality import claim_is_eligible
+
 
 def build_partial_report(
     investigation: dict[str, Any],
@@ -9,25 +12,22 @@ def build_partial_report(
     evidence: list[dict[str, Any]],
     issues: list[dict[str, Any]],
 ) -> tuple[dict[str, Any], str]:
+    # Failed research is a status receipt, not eleven duplicated report chapters.
+    verified = [claim for claim in claims if claim_is_eligible(claim, issues)]
+    pending = [claim for claim in claims if not claim_is_eligible(claim, issues) and claim.get("status") not in {"rejected", "superseded"}]
     definitions = (
-        ("executive_summary", "Executive Summary"),
+        ("executive_summary", "研究进展概览"),
         ("methodology", "研究范围与方法"),
-        ("landscape", "赛道和竞品定义"),
-        ("competitor_profiles", "竞品画像"),
-        ("feature_matrix", "功能能力矩阵"),
-        ("pricing", "定价与商业模式"),
-        ("positioning", "用户与市场定位"),
-        ("strengths_weaknesses", "优势、短板和竞争壁垒"),
-        ("opportunities", "差异化机会"),
+        ("verified_findings", "可引用的发现"),
         ("risks_unknowns", "风险、冲突证据和未知项"),
-        ("evidence_appendix", "Evidence Appendix"),
+        ("evidence_appendix", "资料来源"),
     )
     sections: list[dict[str, Any]] = []
     all_claim_ids = [claim["id"] for claim in claims]
     all_evidence_ids = [item["id"] for item in evidence]
     for section_type, title in definitions:
         lines = [f"## {title}", ""]
-        section_claims = claims
+        section_claims = verified if section_type == "verified_findings" else []
         if section_type == "methodology":
             lines.extend(
                 [
@@ -38,19 +38,19 @@ def build_partial_report(
             )
             section_claims = []
         elif section_type == "executive_summary":
-            supported = sum(claim["status"] == "supported" for claim in claims)
-            lines.append(f"执行在预算或技术闸门处停止。现有 {len(evidence)} 条 Evidence、{len(claims)} 条 Claim，其中 {supported} 条已支持；其余必须视为 uncertain。")
+            lines.append(f"研究尚未完成，已在额度、资料核对或服务异常时停止。现有 {len(evidence)} 份资料、{len(verified)} 条注明来源的可引用结论、{len(pending)} 条待核实结论。以下仅为已有结果。")
             section_claims = []
         elif section_type == "risks_unknowns":
-            section_claims = [claim for claim in claims if claim["status"] != "supported"]
-            lines.extend(f"- Audit Issue：{issue['rule']} — {issue['reason']}" for issue in issues)
+            section_claims = [{**claim, "status": "uncertain"} for claim in pending]
+            lines.extend(f"- 待处理问题：{issue_summary(issue)}" for issue in issues if issue.get("status", "open") == "open")
         elif section_type == "evidence_appendix":
             section_claims = []
             for item in evidence:
-                lines.append(f"- [{item['id']}] {item['title']} — {item['source_domain']} — 可信度 {item['credibility_score']}/100 — {item['source_url']}")
+                lines.append(f"- {item['title']} — {item['source_domain']} — {item['source_url']}")
         if section_claims:
             for claim in section_claims:
-                lines.append(f"- [{claim['status']}] {claim['dimension']}：{claim['text']} (Evidence: {', '.join(claim['evidence_ids']) or 'none'})")
+                label = "待核实" if claim["status"] != "supported" else "可引用"
+                lines.append(f"- [{label}] {claim['dimension']}：{claim_display_text(claim)}（来源编号：{', '.join(claim['evidence_ids']) or '暂无'}）")
         elif len(lines) == 2:
             lines.append("当前结构化证据不足，未形成可审计结论。")
         sections.append(
@@ -65,9 +65,13 @@ def build_partial_report(
         )
     markdown = f"# {investigation['title']}\n\n" + "\n\n".join(section["markdown"] for section in sections) + "\n"
     return {
-        "schema_version": "competitive-report-v1-partial",
+        "schema_version": "competitive-report-v2-partial",
         "title": investigation["title"],
         "partial": True,
+        "quality_policy_version": POLICY_VERSION,
+        "completion_status": "incomplete",
         "claim_ids": all_claim_ids,
+        "claim_versions": {claim["id"]: claim.get("version", 1) for claim in verified},
+        "claim_support_basis": {claim["id"]: claim.get("support_basis", "corroborated") for claim in verified},
         "sections": sections,
     }, markdown

@@ -33,6 +33,10 @@
   those public `add_messages` semantics and cannot be substituted directly.
 
 **Runtime Configuration** (via `config.configurable`):
+- Internally scoped `token_budget_max_tokens` enables strict request preflight;
+  `bounded_tool_names` narrows tools and disables skill discovery and auxiliary
+  memory/title/summarization work for isolated structured tasks. Gateway strips
+  both keys from external context and configurable input.
 - `thinking_enabled` - Enable model's extended thinking
 - `model_name` - Select specific LLM model
 - `is_plan_mode` - Enable TodoList middleware

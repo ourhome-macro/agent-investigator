@@ -28,6 +28,7 @@ class InvestigationRow(InvestigationBase):
     rework_round: Mapped[int] = mapped_column(Integer, default=0)
     failure_retry_count: Mapped[int] = mapped_column(Integer, default=0)
     token_used: Mapped[int] = mapped_column(Integer, default=0)
+    token_reserved: Mapped[int] = mapped_column(Integer, default=0)
     token_budget: Mapped[int] = mapped_column(Integer, default=300_000)
     deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -45,6 +46,7 @@ class ScopeRow(InvestigationBase):
     language: Mapped[str] = mapped_column(String(16))
     time_range: Mapped[str] = mapped_column(String(128))
     dimensions: Mapped[list] = mapped_column(JSON)
+    required_dimensions: Mapped[list] = mapped_column(JSON, default=list)
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
@@ -57,6 +59,7 @@ class CompetitorRow(InvestigationBase):
     canonical_name: Mapped[str] = mapped_column(String(200))
     aliases: Mapped[list] = mapped_column(JSON, default=list)
     official_domains: Mapped[list] = mapped_column(JSON, default=list)
+    official_repositories: Mapped[list] = mapped_column(JSON, default=list)
     category: Mapped[str | None] = mapped_column(String(200), nullable=True)
     status: Mapped[str] = mapped_column(String(24), default="active")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
@@ -157,6 +160,7 @@ class ClaimRow(InvestigationBase):
     claim_type: Mapped[str] = mapped_column(String(32))
     status: Mapped[str] = mapped_column(String(24), index=True)
     independent_source_count: Mapped[int] = mapped_column(Integer, default=0)
+    support_basis: Mapped[str] = mapped_column(String(32), default="unverified")
     created_by_agent: Mapped[str | None] = mapped_column(String(128), nullable=True)
     version: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
@@ -324,3 +328,26 @@ class BudgetEntryRow(InvestigationBase):
     total_tokens: Mapped[int] = mapped_column(Integer, default=0)
     idempotency_key: Mapped[str] = mapped_column(String(200), unique=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+
+
+class BudgetReservationRow(InvestigationBase):
+    __tablename__ = "ci_budget_reservations"
+    id: Mapped[str] = mapped_column(String(200), primary_key=True)
+    investigation_id: Mapped[str] = mapped_column(ForeignKey("ci_investigations.id", ondelete="CASCADE"), index=True)
+    stage: Mapped[str] = mapped_column(String(48))
+    tokens: Mapped[int] = mapped_column(Integer)
+    actual_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+
+
+class ResearchCandidateRow(InvestigationBase):
+    __tablename__ = "ci_candidates"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    investigation_id: Mapped[str] = mapped_column(ForeignKey("ci_investigations.id", ondelete="CASCADE"), index=True)
+    payload: Mapped[dict] = mapped_column(JSON)
+
+
+class ClaimSubmissionRow(InvestigationBase):
+    __tablename__ = "ci_claim_submissions"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    claim_id: Mapped[str] = mapped_column(ForeignKey("ci_claims.id", ondelete="CASCADE"), index=True)

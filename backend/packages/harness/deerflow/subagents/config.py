@@ -41,6 +41,7 @@ class SubagentConfig:
     max_turns: int = 50
     timeout_seconds: int = 900
     token_budget_max_tokens: int | None = None
+    token_budget_preflight: bool = False
 
 
 def _default_model_name(app_config: "AppConfig") -> str:

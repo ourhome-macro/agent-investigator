@@ -921,6 +921,9 @@ class SubagentExecutor:
         """Return the one AppConfig snapshot used throughout this execution."""
         if self._resolved_app_config is None:
             self._resolved_app_config = get_app_config()
+            if self.config.token_budget_preflight:
+                current = self._resolved_app_config
+                self._resolved_app_config = current.model_copy(update={"summarization": current.summarization.model_copy(update={"enabled": False}), "memory": current.memory.model_copy(update={"enabled": False})})
         return self._resolved_app_config
 
     def _create_agent(
@@ -969,6 +972,7 @@ class SubagentExecutor:
             middleware_kwargs["token_budget_override"] = TokenBudgetConfig(
                 enabled=True,
                 max_tokens=self.config.token_budget_max_tokens,
+                preflight=self.config.token_budget_preflight,
                 warn_threshold=0.75,
             )
         if extensions is not None:

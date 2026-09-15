@@ -417,7 +417,7 @@ _CONTEXT_CONFIGURABLE_KEYS: frozenset[str] = frozenset(
 # Keys honored only for internally-authenticated callers (the scheduler path).
 # ``non_interactive`` strips ``ask_clarification`` from the lead-agent toolset;
 # arbitrary HTTP/IM clients must not be able to force autonomous execution.
-_CONTEXT_INTERNAL_CALLER_KEYS: frozenset[str] = frozenset({"non_interactive"})
+_CONTEXT_INTERNAL_CALLER_KEYS: frozenset[str] = frozenset({"non_interactive", "token_budget_max_tokens", "bounded_tool_names"})
 
 # Server-owned authorization and sandbox lifecycle identity fields. These must
 # never be accepted from client-supplied ``body.config.context`` or
@@ -1559,6 +1559,8 @@ async def launch_scheduled_thread_run(
     app: Any | None = None,
     owner_user_id: str | None = None,
     metadata: dict[str, Any] | None = None,
+    token_budget_max_tokens: int | None = None,
+    bounded_tool_names: list[str] | None = None,
 ) -> dict[str, Any]:
     if request is None:
         if app is None:
@@ -1582,7 +1584,12 @@ async def launch_scheduled_thread_run(
         # runtime-context consumers without a ContextVar fallback (e.g.
         # user-scoped GuardrailMiddleware providers) see the owning user;
         # ``inject_authenticated_user_context`` skips the internal user.
-        context=({"non_interactive": True, "user_id": owner_user_id} if owner_user_id else {"non_interactive": True}),
+        context={
+            "non_interactive": True,
+            **({"user_id": owner_user_id} if owner_user_id else {}),
+            **({"token_budget_max_tokens": token_budget_max_tokens} if token_budget_max_tokens is not None else {}),
+            **({"bounded_tool_names": bounded_tool_names} if bounded_tool_names is not None else {}),
+        },
         webhook=None,
         checkpoint_id=None,
         checkpoint=None,
@@ -1600,6 +1607,9 @@ async def launch_scheduled_thread_run(
     )
     scheduled_task_run_id = (metadata or {}).get("scheduled_task_run_id")
     idempotency_key = f"scheduled-task:{scheduled_task_run_id}" if isinstance(scheduled_task_run_id, str) else None
+    ci_execution_key = (metadata or {}).get("ci_execution_key")
+    if isinstance(ci_execution_key, str):
+        idempotency_key = f"research:{owner_user_id}:{ci_execution_key}"
     # Non-HTTP entry point: the lifespan scheduler calls this with a synthetic
     # request, so TraceMiddleware never runs. The scope is opened per launch,
     # never around the poller loop, or every scheduled run would collapse onto

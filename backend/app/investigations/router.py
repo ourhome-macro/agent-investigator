@@ -50,6 +50,9 @@ def _conflict(exc: Exception) -> HTTPException:
 
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_investigation(body: InvestigationCreate, request: Request):
+    service = getattr(request.app.state, "investigation_workflow_service", None)
+    if service is None or not service.provider_status.get("durable_orchestration"):
+        raise HTTPException(status_code=503, detail="Competitive Research requires an available durable workflow runtime")
     result = await _repo(request).create(body, user_id=_user_id())
     service = getattr(request.app.state, "investigation_workflow_service", None)
     if service is not None:
@@ -204,6 +207,23 @@ async def list_pricing(investigation_id: str, request: Request):
     if result is None:
         raise _not_found()
     return result
+
+
+@router.get("/{investigation_id}/coverage")
+async def get_coverage(investigation_id: str, request: Request):
+    from app.investigations.quality import coverage_cells
+
+    repo = _repo(request)
+    owner = _user_id()
+    investigation = await repo.get(investigation_id, user_id=owner)
+    if investigation is None:
+        raise _not_found()
+    return coverage_cells(
+        await repo.list_competitors(investigation_id, user_id=owner) or [],
+        investigation["scope"]["dimensions"],
+        await repo.list_claims(investigation_id, user_id=owner) or [],
+        await repo.list_audit_issues(investigation_id, user_id=owner, status="open") or [],
+    )
 
 
 @router.post("/{investigation_id}/materials", status_code=status.HTTP_201_CREATED)

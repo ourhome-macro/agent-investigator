@@ -137,12 +137,14 @@ class OrchestrationRepository:
             workflow = await session.get(WorkflowRunRow, workflow_run_id, with_for_update=True)
             if workflow is None or workflow.status != "running" or workflow.owner_id != owner_id:
                 raise WorkflowLeaseLost("Workflow lease is not owned by this orchestrator")
-            latest_row = (await session.execute(select(StageAttemptRow).where(StageAttemptRow.workflow_run_id == workflow_run_id, StageAttemptRow.stage == stage.value).order_by(StageAttemptRow.attempt.desc()).limit(1))).scalar_one_or_none()
+            matching_attempts = select(StageItemRow.stage_attempt_id).where(StageItemRow.task_id == tasks[0].task_id, StageItemRow.workflow_run_id == workflow_run_id)
+            task_attempts = (await session.execute(select(func.count()).select_from(StageAttemptRow).where(StageAttemptRow.id.in_(matching_attempts)))).scalar_one()
+            latest_row = (await session.execute(select(StageAttemptRow).where(StageAttemptRow.id.in_(matching_attempts)).order_by(StageAttemptRow.attempt.desc()).limit(1))).scalar_one_or_none()
             if latest_row is not None and latest_row.status in {"running", "completed"}:
                 existing_items = list((await session.execute(select(StageItemRow).where(StageItemRow.stage_attempt_id == latest_row.id))).scalars())
                 if {row.task_id for row in existing_items} == {task.task_id for task in tasks}:
-                    return self._attempt_dict(latest_row, resumed=True)
-            if latest_row is not None and latest_row.status == "failed" and latest_row.attempt >= 3:
+                    return {**self._attempt_dict(latest_row, resumed=True), "task_attempt": task_attempts}
+            if latest_row is not None and latest_row.status == "failed" and task_attempts >= 3:
                 raise StageRetryExhausted(f"Stage {stage.value} exhausted 3 attempts")
             latest = (
                 await session.execute(
@@ -183,7 +185,7 @@ class OrchestrationRepository:
                         updated_at=now,
                     )
                 )
-            return self._attempt_dict(attempt, resumed=False)
+            return {**self._attempt_dict(attempt, resumed=False), "task_attempt": task_attempts + 1}
 
     async def bind_run(self, stage_attempt_id: str, *, run_id: str) -> None:
         async with self._sf() as session, session.begin():
@@ -239,6 +241,18 @@ class OrchestrationRepository:
             if row is None or row.submission is None:
                 return None
             return DomainSubmission.model_validate(row.submission)
+
+    async def get_stage_tasks(self, stage_attempt_id: str, *, user_id: str) -> list[StageTask]:
+        async with self._sf() as session:
+            rows = (
+                await session.execute(
+                    select(StageItemRow)
+                    .join(WorkflowRunRow, WorkflowRunRow.id == StageItemRow.workflow_run_id)
+                    .join(InvestigationRow, InvestigationRow.id == WorkflowRunRow.investigation_id)
+                    .where(StageItemRow.stage_attempt_id == stage_attempt_id, InvestigationRow.user_id == user_id)
+                )
+            ).scalars()
+            return [StageTask.model_validate(row.task_envelope) for row in rows]
 
     async def submit_domain_submission(
         self,
@@ -337,6 +351,10 @@ class OrchestrationRepository:
 
     @staticmethod
     def _item_dict(row: StageItemRow) -> dict[str, Any]:
+        task_input = (row.task_envelope or {}).get("input", {})
+        subject = task_input.get("competitor") or task_input.get("dimension")
+        if not isinstance(subject, str):
+            subject = f"{len(task_input['claims'])} 条结论" if isinstance(task_input.get("claims"), list) else ""
         return {
             "id": row.id,
             "task_id": row.task_id,
@@ -344,6 +362,7 @@ class OrchestrationRepository:
             "stage_attempt_id": row.stage_attempt_id,
             "stage": row.stage,
             "item_key": row.item_key,
+            "subject_label": subject,
             "role": row.role,
             "status": row.status,
             "attempt": row.attempt,

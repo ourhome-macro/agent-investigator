@@ -64,6 +64,22 @@ Failed investigations expose bounded technical recovery and partial uncertainty
 report actions. Batch Item state should update while the batch is running, not
 only after terminal receipts arrive.
 
+The research detail page reads `/coverage`, displays server-side
+`publication_eligible` separately from raw semantic status, and labels partial
+publication explicitly. Reports use the safe Markdown renderer. Polling stops
+at approval/terminal states and pauses on hidden pages; outstanding reads must
+not overwrite a newer investigation or a confirmed mutation. Quality helpers
+and their tests live under `core/investigations` and the matching test directory.
+
+Research workspace copy must explain what the user knows and what to do next.
+Translate stage/Issue/binding codes through the research presentation helpers;
+show Claim `display_text`, source-level labels and their limitations. Runtime
+IDs and raw errors belong in closed technical details. Do not describe a vendor
+statement or a user report as independently verified. Completed reports with
+known optional gaps remain distinguishable from interrupted research. The
+creation form allows explicit required dimensions; scope approval shows those
+requirements and approved official domains/repository roots.
+
 ```
 Frontend (Next.js) ──▶ LangGraph SDK ──▶ LangGraph Backend (lead_agent)
                                               ├── Sub-Agents

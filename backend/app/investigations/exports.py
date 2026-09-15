@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import html
 import os
+import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -73,6 +74,9 @@ body {{ font-family: "Noto Sans CJK SC", "Microsoft YaHei", "PingFang SC", sans-
 h1 {{ font-size:24pt; border-bottom:2px solid #1f4f8f; padding-bottom:8px; }}
 h2 {{ font-size:16pt; margin-top:24px; color:#173f73; break-after:avoid; }}
 li {{ margin:5px 0; }} a {{ color:#175f9e; overflow-wrap:anywhere; }}
+table {{ border-collapse:collapse; width:100%; font-size:9pt; }}
+th, td {{ border:1px solid #cbd5e1; padding:6px; overflow-wrap:anywhere; }}
+thead {{ display:table-header-group; }} tr {{ break-inside:avoid; }}
 .meta {{ color:#68758a; font-size:9pt; }}
 </style></head><body><div class="meta">Structured Competitive Research · Report v{report.get("version")}</div>{body}</body></html>"""
 
@@ -80,8 +84,25 @@ li {{ margin:5px 0; }} a {{ color:#175f9e; overflow-wrap:anywhere; }}
 def _markdown_to_html(markdown: str) -> str:
     output: list[str] = []
     in_list = False
+    in_table = False
     for raw in markdown.splitlines():
         line = raw.strip()
+        if line.startswith("|") and line.endswith("|"):
+            if in_list:
+                output.append("</ul>")
+                in_list = False
+            cells = [cell.strip().replace("\\|", "|") for cell in re.split(r"(?<!\\)\|", line[1:-1])]
+            if all(re.fullmatch(r":?-{3,}:?", cell) for cell in cells):
+                continue
+            if not in_table:
+                output.append("<table><thead><tr>" + "".join(f"<th>{html.escape(cell)}</th>" for cell in cells) + "</tr></thead><tbody>")
+                in_table = True
+            else:
+                output.append("<tr>" + "".join(f"<td>{html.escape(cell)}</td>" for cell in cells) + "</tr>")
+            continue
+        if in_table:
+            output.append("</tbody></table>")
+            in_table = False
         if line.startswith("# "):
             if in_list:
                 output.append("</ul>")
@@ -104,6 +125,8 @@ def _markdown_to_html(markdown: str) -> str:
             output.append(f"<p>{html.escape(line)}</p>")
     if in_list:
         output.append("</ul>")
+    if in_table:
+        output.append("</tbody></table>")
     return "\n".join(output)
 
 

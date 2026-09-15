@@ -8,7 +8,7 @@ points to the module-level guides that own the depth:
 - Frontend depth → [`frontend/AGENTS.md`](../frontend/AGENTS.md)
 
 DeerFlow 2.0 is a ground-up rewrite of the original Deep Research framework (see
-[`README.md`](../README.md)); it shares no code with v1.
+[`DeerFlow runtime reference`](../DEERFLOW_REFERENCE.md)); it shares no code with v1.
 
 ---
 

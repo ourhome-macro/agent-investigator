@@ -29,6 +29,7 @@ Stop-reason surfacing (#3875 Phase 2):
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 from collections.abc import Awaitable, Callable
@@ -76,6 +77,7 @@ class TokenBudgetMiddleware(AgentMiddleware[AgentState]):
         # ``_clear_run_state``/``after_agent`` so the executor can consume it
         # after the run returns; bounded so abandoned runs cannot leak.
         self._stop_reason: BoundedDict[str, str] = BoundedDict(1000)
+        self._preflight_usage: BoundedDict[str, int] = BoundedDict(1000)
 
     def release_policy_parameters(self) -> dict[str, object]:
         return {"config": self._config.model_dump(mode="python")}
@@ -91,6 +93,7 @@ class TokenBudgetMiddleware(AgentMiddleware[AgentState]):
             self._seen_messages.clear()
             self._cumulative_usage.clear()
             self._stop_reason.clear()
+            self._preflight_usage.clear()
 
     def consume_stop_reason(self, run_id: str | None) -> str | None:
         """Pop and return the stop reason the hard-stop set for this run.
@@ -118,6 +121,7 @@ class TokenBudgetMiddleware(AgentMiddleware[AgentState]):
             self._pending_warnings.pop(run_id, None)
             self._seen_messages.pop(run_id, None)
             self._cumulative_usage.pop(run_id, None)
+            self._preflight_usage.pop(run_id, None)
 
     @override
     def before_agent(self, state: AgentState, runtime: Runtime) -> None:
@@ -308,10 +312,67 @@ class TokenBudgetMiddleware(AgentMiddleware[AgentState]):
         warnings = self._drain_pending_warnings(request.runtime)
         request = self._inject_warnings(request, warnings)
 
-        return handler(request)
+        request, reservation = self._reserve_request(request)
+        response = handler(request)
+        self._settle_request(request, response, reservation)
+        return response
 
     @override
     async def awrap_model_call(self, request: ModelRequest, handler: Callable[[ModelRequest], Awaitable[ModelResponse]]) -> ModelCallResult:
         warnings = self._drain_pending_warnings(request.runtime)
         request = self._inject_warnings(request, warnings)
-        return await handler(request)
+        request, reservation = self._reserve_request(request)
+        response = await handler(request)
+        self._settle_request(request, response, reservation)
+        return response
+
+    def _reserve_request(self, request):
+        if not self._config.enabled or not self._config.preflight:
+            return request, 0
+        from langchain_core.utils.function_calling import convert_to_openai_tool
+
+        messages = list(request.messages)
+        if request.system_message is not None:
+            messages.insert(0, request.system_message)
+        payload = {"messages": [message.model_dump() for message in messages], "tools": [convert_to_openai_tool(tool) for tool in request.tools]}
+        # UTF-8 bytes bound text BPE tokens conservatively; reject non-text
+        # research requests rather than pretending to budget image/audio tokens.
+        if any(not isinstance(message.content, str) for message in messages):
+            raise RuntimeError("Strict token budget requires text-only messages")
+        input_bound = len(json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")) + 512
+        run_id = self._get_run_id(request.runtime)
+        with self._lock:
+            used = self._preflight_usage.get(run_id, 0)
+            available = self._config.max_tokens - used - input_bound
+            if available < 256:
+                self._stop_reason[run_id] = "token_capped"
+                if isinstance(request.runtime.context, dict):
+                    request.runtime.context["stop_reason"] = "token_capped"
+                raise RuntimeError("Token budget cannot reserve the next model request")
+            settings = dict(request.model_settings)
+            requested = settings.get("max_completion_tokens") or settings.get("max_tokens") or 4096
+            output_cap = min(int(requested), available)
+            reservation = input_bound + output_cap
+            self._preflight_usage[run_id] = used + reservation
+        if "max_completion_tokens" in settings:
+            settings.pop("max_tokens", None)
+            settings["max_completion_tokens"] = output_cap
+        else:
+            settings["max_tokens"] = output_cap
+        overrides = {"model_settings": settings}
+        model = getattr(request, "model", None)
+        if model is not None and "max_retries" in getattr(type(model), "model_fields", {}):
+            overrides["model"] = model.model_copy(update={"max_retries": 0})
+        return request.override(**overrides), reservation
+
+    def _settle_request(self, request, response, reservation):
+        if not reservation:
+            return
+        messages = getattr(response, "result", [])
+        usages = [message.usage_metadata for message in messages if isinstance(message, AIMessage) and message.usage_metadata]
+        if not usages:
+            return  # Unknown billing cannot release an already dispatched request.
+        actual = sum(int(usage.get("total_tokens") or usage.get("input_tokens", 0) + usage.get("output_tokens", 0)) for usage in usages)
+        run_id = self._get_run_id(request.runtime)
+        with self._lock:
+            self._preflight_usage[run_id] = self._preflight_usage.get(run_id, reservation) - reservation + actual

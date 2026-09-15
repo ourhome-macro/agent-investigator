@@ -3,6 +3,7 @@ import { fetch } from "@/core/api/fetcher";
 import type {
   AuditIssue,
   Claim,
+  CoverageCell,
   Evidence,
   Investigation,
   PriceObservation,
@@ -87,6 +88,12 @@ export async function listEvidence(id: string): Promise<Evidence[]> {
 export async function listClaims(id: string): Promise<Claim[]> {
   return json(
     await fetch(`/api/investigations/${encodeURIComponent(id)}/claims`),
+  );
+}
+
+export async function getCoverage(id: string): Promise<CoverageCell[]> {
+  return json(
+    await fetch(`/api/investigations/${encodeURIComponent(id)}/coverage`),
   );
 }
 

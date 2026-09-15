@@ -26,6 +26,7 @@ class BatchSubmitRequest:
     max_live_items: int | None
     max_running_items: int | None
     execution_spec: dict[str, Any]
+    max_attempts: int | None = None
 
 
 class SubagentBatchSubmitter(Protocol):

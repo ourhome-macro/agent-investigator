@@ -50,7 +50,7 @@ class DurableStageBatchAdapter:
             StageName.ANALYZING: "submit_claims",
         }.get(tasks[0].stage)
         allowed_tools = [submission_tool] if submission_tool else []
-        item_token_budget = 35_000 if tasks[0].stage in {StageName.COLLECTING, StageName.REWORKING} else 30_000
+        item_token_budget = min(int(task.input.get("execution_token_cap", 35_000 if task.stage in {StageName.COLLECTING, StageName.REWORKING} else 30_000)) for task in tasks)
         config = replace(
             config,
             model=model_name,
@@ -63,6 +63,7 @@ class DurableStageBatchAdapter:
             max_turns=20,
             timeout_seconds=240,
             token_budget_max_tokens=item_token_budget,
+            token_budget_preflight=True,
         )
         items: list[BatchItemInput] = [
             {
@@ -96,6 +97,9 @@ class DurableStageBatchAdapter:
                     "is_internal": True,
                     "authz_attributes": {},
                 },
+                # Each research retry must acquire a fresh investigation quota.
+                # Workflow recovery/rework owns retries instead of hidden batch retries.
+                max_attempts=1,
             )
         )
         batch_items = await self._batch_repository.list_items(

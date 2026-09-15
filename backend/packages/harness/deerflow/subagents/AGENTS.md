@@ -1,5 +1,11 @@
 ### Subagent System (`packages/harness/deerflow/subagents/`)
 
+`SubagentConfig.token_budget_preflight` opts bounded tasks into request-before-
+dispatch token reservation and disables auxiliary summarization/memory work.
+`BatchSubmitRequest.max_attempts` can narrow, never widen, the configured retry
+limit; callers that reserve execution capacity externally can request one attempt
+and obtain a new reservation before retrying.
+
 **Durable batch acceptance**: `batch_task` normalizes optional per-item criteria
 before persistence (empty becomes null; 20 items × 500 neutralized characters),
 sharing `normalize_acceptance_criteria` with the executor and checker.

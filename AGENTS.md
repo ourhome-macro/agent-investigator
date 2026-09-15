@@ -206,6 +206,10 @@ cd frontend && pnpm rstest run <pattern>     # e.g. pnpm rstest run my-component
 - Setup & install → **[Install.md](Install.md)**, **[CONTRIBUTING.md](CONTRIBUTING.md)**
 - Project overview & usage → **[README.md](README.md)** (translations: `README_zh.md`,
   `README_ja.md`, `README_fr.md`, `README_ru.md`)
+- Current research documentation → **[docs/README.md](docs/README.md)**. The root
+  README introduces Agent Investigator; `DEERFLOW_REFERENCE.md` and `README_*.md`
+  preserve inherited DeerFlow runtime references. Historical assessments are
+  labelled in the documentation index and do not override current contracts.
 - Security policy → **[SECURITY.md](SECURITY.md)**
 - Changes → **[CHANGELOG.md](CHANGELOG.md)**
 - Cutting a release → **[RELEASING.md](RELEASING.md)**

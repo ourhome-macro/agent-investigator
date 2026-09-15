@@ -26,3 +26,10 @@ def test_report_html_escapes_untrusted_markdown() -> None:
     )
     assert "<script>alert" not in document
     assert "&lt;script&gt;alert" in document
+
+
+def test_pdf_renders_a_real_comparison_table_and_escapes_cells():
+    document = render_report_html({"version": 1, "rendered_markdown": "| Product | State |\n|---|---|\n| Acme | <script>bad</script> |"})
+    assert "<table>" in document and "<th>Product</th>" in document
+    assert "<td>Acme</td>" in document
+    assert "<script>" not in document

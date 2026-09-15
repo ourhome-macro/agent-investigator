@@ -3,11 +3,13 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from urllib.parse import urlsplit
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.investigations.confidence import POLICY_VERSION, assess_support, claim_display_text, completion_state, is_official_source, issue_is_blocking
 from app.investigations.contracts import (
     ClaimCreate,
     ClaimEvidenceRelation,
@@ -29,8 +31,10 @@ from app.investigations.evidence_validation import (
 from app.investigations.persistence.models import (
     AuditIssueRow,
     BudgetEntryRow,
+    BudgetReservationRow,
     ClaimEvidenceRow,
     ClaimRow,
+    ClaimSubmissionRow,
     CompetitorRow,
     EvidenceChunkRow,
     EvidenceRow,
@@ -41,6 +45,7 @@ from app.investigations.persistence.models import (
     PriceObservationRow,
     ReportRow,
     ReportSectionRow,
+    ResearchCandidateRow,
     ScopeRow,
     StageAttemptRow,
     WorkflowRunRow,
@@ -95,7 +100,7 @@ class InvestigationRepository:
                 title=request.title,
                 brief=request.brief,
                 status=InvestigationStatus.PLANNING.value,
-                workflow_version="competitive-research-v1",
+                workflow_version="competitive-research-v2",
                 token_budget=min(525_000, 300_000 + max(0, len(request.scope.competitors) - 2) * 75_000),
                 deadline_at=now + timedelta(minutes=30),
                 created_at=now,
@@ -110,6 +115,7 @@ class InvestigationRepository:
                 language=request.scope.language,
                 time_range=request.scope.time_range,
                 dimensions=request.scope.dimensions,
+                required_dimensions=request.scope.required_dimensions,
                 created_at=now,
                 updated_at=now,
             )
@@ -126,6 +132,7 @@ class InvestigationRepository:
                         investigation_id=investigation_id,
                         canonical_name=name,
                         official_domains=request.scope.official_domains.get(name, []),
+                        official_repositories=request.scope.official_repositories.get(name, []),
                     )
                 )
             session.add(
@@ -160,7 +167,7 @@ class InvestigationRepository:
             return None
         async with self._sf() as session:
             rows = list((await session.execute(select(CompetitorRow).where(CompetitorRow.investigation_id == investigation_id).order_by(CompetitorRow.created_at))).scalars())
-            return [{"id": row.id, "name": row.canonical_name, "official_domains": row.official_domains} for row in rows]
+            return [{"id": row.id, "name": row.canonical_name, "official_domains": row.official_domains, "official_repositories": row.official_repositories} for row in rows]
 
     async def list_recoverable(self) -> list[tuple[str, str]]:
         statuses = [
@@ -169,6 +176,7 @@ class InvestigationRepository:
             InvestigationStatus.NORMALIZING.value,
             InvestigationStatus.ANALYZING.value,
             InvestigationStatus.AUDITING.value,
+            InvestigationStatus.REWORKING.value,
             InvestigationStatus.SYNTHESIZING.value,
         ]
         async with self._sf() as session:
@@ -192,14 +200,99 @@ class InvestigationRepository:
                 raise InvestigationDeadlineExceeded("Investigation deadline has expired")
             reserve_stages = {"auditing", "reworking", "synthesizing"}
             usable_budget = investigation.token_budget if stage in reserve_stages else int(investigation.token_budget * 0.8)
-            if investigation.token_used + max(0, estimated_tokens) > usable_budget:
+            if investigation.token_used + investigation.token_reserved + max(0, estimated_tokens) > usable_budget:
                 raise InvestigationBudgetExceeded(f"Stage {stage} would exceed its token budget: used={investigation.token_used}, estimated={estimated_tokens}, usable={usable_budget}")
             return {
                 "used": investigation.token_used,
                 "budget": investigation.token_budget,
                 "usable": usable_budget,
-                "remaining": max(0, usable_budget - investigation.token_used),
+                "remaining": max(0, usable_budget - investigation.token_used - investigation.token_reserved),
             }
+
+    async def reserve_budget(self, investigation_id: str, *, user_id: str, stage: str, reservation_key: str, tokens: int) -> None:
+        try:
+            await self._reserve_budget_once(investigation_id, user_id=user_id, stage=stage, reservation_key=reservation_key, tokens=tokens)
+        except IntegrityError:
+            await self._reserve_budget_once(investigation_id, user_id=user_id, stage=stage, reservation_key=reservation_key, tokens=tokens)
+
+    async def _reserve_budget_once(self, investigation_id: str, *, user_id: str, stage: str, reservation_key: str, tokens: int) -> None:
+        if tokens <= 0:
+            raise ValueError("Reservation must be positive")
+        key = f"{investigation_id}:{reservation_key}"
+        async with self._sf() as session, session.begin():
+            row = await session.get(InvestigationRow, investigation_id)
+            if row is None or row.user_id != user_id:
+                raise LookupError("Investigation not found")
+            existing = await session.get(BudgetReservationRow, key)
+            if existing is not None:
+                if existing.tokens != tokens or existing.stage != stage:
+                    raise InvestigationConflict("Budget reservation input changed")
+                return
+            usable = row.token_budget if stage in {"auditing", "synthesizing"} else int(row.token_budget * 0.8)
+            result = await session.execute(
+                update(InvestigationRow)
+                .where(
+                    InvestigationRow.id == investigation_id,
+                    InvestigationRow.user_id == user_id,
+                    InvestigationRow.token_used + InvestigationRow.token_reserved + tokens <= usable,
+                    (InvestigationRow.deadline_at.is_(None)) | (InvestigationRow.deadline_at > datetime.now(UTC)),
+                )
+                .values(token_reserved=InvestigationRow.token_reserved + tokens)
+            )
+            if result.rowcount != 1:
+                raise InvestigationBudgetExceeded("Insufficient unreserved investigation budget or deadline expired")
+            session.add(BudgetReservationRow(id=key, investigation_id=investigation_id, stage=stage, tokens=tokens))
+
+    async def settle_budget(self, investigation_id: str, *, user_id: str, reservation_key: str, actual_tokens: int, already_recorded: bool = False) -> None:
+        if actual_tokens < 0:
+            raise ValueError("Token usage cannot be negative")
+        async with self._sf() as session, session.begin():
+            row = await session.get(InvestigationRow, investigation_id, with_for_update=True)
+            if row is None or row.user_id != user_id:
+                raise LookupError("Investigation not found")
+            reservation = await session.get(BudgetReservationRow, f"{investigation_id}:{reservation_key}")
+            if reservation is None:
+                raise InvestigationConflict("Missing budget reservation")
+            result = await session.execute(update(BudgetReservationRow).where(BudgetReservationRow.id == reservation.id, BudgetReservationRow.actual_tokens.is_(None)).values(actual_tokens=actual_tokens))
+            if result.rowcount != 1:
+                return
+            await session.execute(
+                update(InvestigationRow)
+                .where(InvestigationRow.id == investigation_id)
+                .values(token_reserved=InvestigationRow.token_reserved - reservation.tokens, token_used=InvestigationRow.token_used + (0 if already_recorded else actual_tokens))
+            )
+            session.add(
+                InvestigationEventRow(
+                    investigation_id=investigation_id,
+                    stage=reservation.stage,
+                    event_type="ci.budget.settled",
+                    payload={"reservation_key": reservation_key, "reserved": reservation.tokens, "actual": actual_tokens, "overrun": actual_tokens > reservation.tokens},
+                )
+            )
+
+    async def record_control_event(self, investigation_id: str, *, user_id: str, event_type: str, payload: dict, stage: str | None = None) -> None:
+        async with self._sf() as session, session.begin():
+            row = await session.get(InvestigationRow, investigation_id)
+            if row is None or row.user_id != user_id:
+                raise LookupError("Investigation not found")
+            session.add(InvestigationEventRow(investigation_id=investigation_id, event_type=event_type, payload=payload, stage=stage))
+
+    async def save_candidate(self, investigation_id: str, *, user_id: str, payload: dict) -> str:
+        key = sha256_text(f"{investigation_id}:{payload['competitor_id']}:{payload['dimension']}:{payload['url']}:{payload['content_hash']}")
+        async with self._sf() as session, session.begin():
+            investigation = await session.get(InvestigationRow, investigation_id, with_for_update=True)
+            if investigation is None or investigation.user_id != user_id:
+                raise LookupError("Investigation not found")
+            if await session.get(ResearchCandidateRow, key) is None:
+                session.add(ResearchCandidateRow(id=key, investigation_id=investigation_id, payload=payload))
+        return key
+
+    async def get_candidate(self, investigation_id: str, candidate_id: str, *, user_id: str) -> dict | None:
+        if await self.get(investigation_id, user_id=user_id) is None:
+            return None
+        async with self._sf() as session:
+            row = await session.get(ResearchCandidateRow, candidate_id)
+            return row.payload if row is not None and row.investigation_id == investigation_id else None
 
     async def record_token_usage(
         self,
@@ -227,7 +320,7 @@ class InvestigationRepository:
             if existing is not None:
                 return {"used": investigation.token_used, "budget": investigation.token_budget}
             previous = investigation.token_used
-            investigation.token_used += total_tokens
+            await session.execute(update(InvestigationRow).where(InvestigationRow.id == investigation_id).values(token_used=InvestigationRow.token_used + total_tokens))
             session.add(
                 BudgetEntryRow(
                     id=self._id(),
@@ -279,6 +372,7 @@ class InvestigationRepository:
             row.version += 1
             row.market, row.audience, row.language, row.time_range = scope.market, scope.audience, scope.language, scope.time_range
             row.dimensions, row.updated_at = scope.dimensions, datetime.now(UTC)
+            row.required_dimensions = scope.required_dimensions
             await session.execute(CompetitorRow.__table__.delete().where(CompetitorRow.investigation_id == investigation_id))
             session.add_all(
                 [
@@ -287,6 +381,7 @@ class InvestigationRepository:
                         investigation_id=investigation_id,
                         canonical_name=name,
                         official_domains=scope.official_domains.get(name, []),
+                        official_repositories=scope.official_repositories.get(name, []),
                     )
                     for name in scope.competitors
                 ]
@@ -308,6 +403,7 @@ class InvestigationRepository:
             scope_row.language = scope.language
             scope_row.time_range = scope.time_range
             scope_row.dimensions = scope.dimensions
+            scope_row.required_dimensions = scope.required_dimensions
             scope_row.updated_at = datetime.now(UTC)
             await session.execute(CompetitorRow.__table__.delete().where(CompetitorRow.investigation_id == investigation_id))
             session.add_all(
@@ -317,6 +413,7 @@ class InvestigationRepository:
                         investigation_id=investigation_id,
                         canonical_name=name,
                         official_domains=scope.official_domains.get(name, []),
+                        official_repositories=scope.official_repositories.get(name, []),
                     )
                     for name in scope.competitors
                 ]
@@ -526,10 +623,35 @@ class InvestigationRepository:
             }:
                 raise InvestigationConflict("Claims can only be submitted during analyzing or reworking")
             if idempotency_key is not None:
-                existing = (await session.execute(select(ClaimRow).where(ClaimRow.idempotency_key == idempotency_key))).scalar_one_or_none()
+                alias = await session.get(ClaimSubmissionRow, sha256_text(f"{investigation_id}:{idempotency_key}"))
+                existing = (
+                    await session.get(ClaimRow, alias.claim_id) if alias else (await session.execute(select(ClaimRow).where(ClaimRow.investigation_id == investigation_id, ClaimRow.idempotency_key == idempotency_key))).scalar_one_or_none()
+                )
                 if existing is not None:
                     links = list((await session.execute(select(ClaimEvidenceRow).where(ClaimEvidenceRow.claim_id == existing.id))).scalars())
                     return self._claim_dict(existing, [self._claim_link_dict(link) for link in links])
+            normalized = " ".join(request.text.casefold().split())
+            existing = (
+                await session.execute(
+                    select(ClaimRow)
+                    .where(
+                        ClaimRow.investigation_id == investigation_id,
+                        ClaimRow.competitor_id == request.competitor_id,
+                        ClaimRow.dimension == request.dimension,
+                        ClaimRow.claim_type == request.claim_type,
+                        ClaimRow.normalized_text == normalized,
+                    )
+                    .order_by(ClaimRow.created_at)
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if existing is not None:
+                if existing.status in {"rejected", "superseded"}:
+                    raise InvestigationConflict("A retired Claim cannot be reintroduced without a revised proposition")
+                if idempotency_key:
+                    session.add(ClaimSubmissionRow(id=sha256_text(f"{investigation_id}:{idempotency_key}"), claim_id=existing.id))
+                links = list((await session.execute(select(ClaimEvidenceRow).where(ClaimEvidenceRow.claim_id == existing.id))).scalars())
+                return self._claim_dict(existing, [self._claim_link_dict(link) for link in links])
             binding_by_id = {binding.evidence_id: binding for binding in request.evidence_bindings}
             evidence_rows = list(
                 (
@@ -544,6 +666,12 @@ class InvestigationRepository:
             )
             if len(evidence_rows) != len(binding_by_id):
                 raise InvestigationConflict("Claim references missing or inactive evidence")
+            if request.competitor_id:
+                competitor = await session.get(CompetitorRow, request.competitor_id)
+                if competitor is None or competitor.investigation_id != investigation_id:
+                    raise InvestigationConflict("Claim competitor does not belong to investigation")
+                if any(item.competitor_id and item.competitor_id != request.competitor_id for item in evidence_rows):
+                    raise InvestigationConflict("Atomic Claim cannot borrow another competitor's Evidence")
             validated_links: list[tuple[EvidenceRow, Any, Any]] = []
             for evidence in evidence_rows:
                 binding = binding_by_id[evidence.id]
@@ -593,6 +721,8 @@ class InvestigationRepository:
             )
             session.add(claim)
             await session.flush()
+            if idempotency_key:
+                session.add(ClaimSubmissionRow(id=sha256_text(f"{investigation_id}:{idempotency_key}"), claim_id=claim.id))
             session.add_all(
                 [
                     ClaimEvidenceRow(
@@ -614,11 +744,13 @@ class InvestigationRepository:
             for price in request.price_observations:
                 evidence = evidence_by_id[price.evidence_id]
                 official_domains: list[str] = []
+                official_repositories: list[str] = []
                 if evidence.competitor_id:
                     competitor = await session.get(CompetitorRow, evidence.competitor_id)
                     if competitor is not None:
                         official_domains = competitor.official_domains
-                verified_official = any(evidence.source_domain == domain or evidence.source_domain.endswith(f".{domain}") for domain in official_domains)
+                        official_repositories = competitor.official_repositories
+                verified_official = is_official_source(evidence.source_url, official_domains, official_repositories)
                 if price.official and not verified_official:
                     raise InvestigationConflict("Official PriceObservation domain is not approved in the research scope")
                 try:
@@ -652,7 +784,7 @@ class InvestigationRepository:
                         tax_included=price.tax_included,
                         promotion=price.promotion,
                         effective_at=price.effective_at,
-                        official=price.official,
+                        official=verified_official,
                         verbatim_quote=price_quote.quote,
                         snapshot_sha256=price_quote.snapshot_sha256,
                     )
@@ -691,7 +823,11 @@ class InvestigationRepository:
             by_claim: dict[str, list[dict[str, Any]]] = {}
             for link in links:
                 by_claim.setdefault(link.claim_id, []).append(self._claim_link_dict(link))
-            return [self._claim_dict(row, by_claim.get(row.id, [])) for row in rows]
+            from app.investigations.quality import claim_is_eligible
+
+            issues = await self.list_audit_issues(investigation_id, user_id=user_id, status="open") or []
+            result = [self._claim_dict(row, by_claim.get(row.id, [])) for row in rows]
+            return [{**claim, "publication_eligible": claim_is_eligible(claim, issues)} for claim in result]
 
     async def list_price_observations(self, investigation_id: str, *, user_id: str) -> list[dict[str, Any]] | None:
         if await self.get(investigation_id, user_id=user_id) is None:
@@ -715,6 +851,8 @@ class InvestigationRepository:
                 raise LookupError("Investigation not found")
             if investigation.status != InvestigationStatus.AUDITING.value:
                 raise InvestigationConflict("Binding verdicts can only be submitted during auditing")
+            active_ids = select(ClaimRow.id).where(ClaimRow.investigation_id == investigation_id, ClaimRow.status.not_in(["superseded", "rejected"]))
+            await session.execute(update(ClaimEvidenceRow).where(ClaimEvidenceRow.claim_id.in_(active_ids)).values(entailment_status="pending_audit"))
             for verdict in verdicts:
                 status = str(verdict.get("verdict") or "")
                 if status not in allowed:
@@ -735,18 +873,37 @@ class InvestigationRepository:
                     continue
                 link.entailment_status = status
                 link.auditor_status = auditor
+                if link.relation == ClaimEvidenceRelation.CONTEXT.value:
+                    if status == "entails":
+                        link.relation = ClaimEvidenceRelation.SUPPORTS.value
+                    elif status == "contradicts":
+                        link.relation = ClaimEvidenceRelation.CONTRADICTS.value
 
             claims = list((await session.execute(select(ClaimRow).where(ClaimRow.investigation_id == investigation_id))).scalars())
             for claim in claims:
+                if claim.status in {"superseded", "rejected"}:
+                    continue
                 rows = list((await session.execute(select(ClaimEvidenceRow, EvidenceRow).join(EvidenceRow, EvidenceRow.id == ClaimEvidenceRow.evidence_id).where(ClaimEvidenceRow.claim_id == claim.id))).all())
-                supporting_domains = [evidence.source_domain for link, evidence in rows if link.relation == ClaimEvidenceRelation.SUPPORTS.value and link.entailment_status == "entails"]
+                supporting = [
+                    (link, evidence) for link, evidence in rows if evidence.status == "active" and link.validation_status == "verified" and link.relation == ClaimEvidenceRelation.SUPPORTS.value and link.entailment_status == "entails"
+                ]
+                competitor = await session.get(CompetitorRow, claim.competitor_id) if claim.competitor_id else None
+                sources = []
+                for _, evidence in supporting:
+                    snapshot = await session.get(EvidenceSnapshotRow, evidence.snapshot_id) if evidence.snapshot_id else None
+                    if snapshot is None or snapshot.extraction_method == "search_snippet":
+                        continue
+                    official = bool(competitor and evidence.competitor_id == competitor.id and is_official_source(evidence.source_url, competitor.official_domains, competitor.official_repositories))
+                    sources.append({"domain": urlsplit(evidence.source_url).hostname or "", "official": official})
                 has_contradiction = any(link.entailment_status == "contradicts" or link.relation == ClaimEvidenceRelation.CONTRADICTS.value for link, _ in rows)
-                count = independent_source_count(supporting_domains)
+                count = independent_source_count(source["domain"] for source in sources)
                 claim.independent_source_count = count
                 if has_contradiction:
                     claim.status = ClaimStatus.CONTRADICTED.value if count == 0 else ClaimStatus.UNCERTAIN.value
+                    claim.support_basis = "unverified"
                 else:
-                    claim.status = (ClaimStatus.SUPPORTED if count >= (2 if claim.material else 1) else ClaimStatus.UNCERTAIN).value
+                    claim.support_basis = assess_support(claim.claim_type, claim.text, sources)
+                    claim.status = (ClaimStatus.SUPPORTED if claim.support_basis != "unverified" else ClaimStatus.UNCERTAIN).value
 
     async def retrieve_context(
         self,
@@ -755,6 +912,7 @@ class InvestigationRepository:
         user_id: str,
         query: str,
         limit: int = 12,
+        competitor_id: str | None = None,
     ) -> list[dict[str, Any]] | None:
         if await self.get(investigation_id, user_id=user_id) is None:
             return None
@@ -795,6 +953,9 @@ class InvestigationRepository:
         query_embedding = None
         if self._embedding_provider is not None:
             query_embedding = (await self._embedding_provider.embed_texts([query]))[0]
+        if competitor_id is not None:
+            allowed = {item["id"] for item in await self.list_evidence(investigation_id, user_id=user_id) or [] if item.get("competitor_id") == competitor_id}
+            chunks = [chunk for chunk in chunks if chunk["evidence_id"] in allowed]
         ranked = rank_chunks(query, chunks, limit=limit, query_embedding=query_embedding)
         return [{key: value for key, value in chunk.items() if key != "embedding"} for chunk in ranked]
 
@@ -805,6 +966,7 @@ class InvestigationRepository:
         evidence_ids: list[str],
         *,
         user_id: str,
+        relation: ClaimEvidenceRelation = ClaimEvidenceRelation.SUPPORTS,
     ) -> dict[str, Any] | None:
         async with self._sf() as session, session.begin():
             investigation = await session.get(InvestigationRow, investigation_id, with_for_update=True)
@@ -845,7 +1007,7 @@ class InvestigationRepository:
                     ClaimEvidenceRow(
                         claim_id=claim.id,
                         evidence_id=row.id,
-                        relation=ClaimEvidenceRelation.SUPPORTS.value,
+                        relation=relation.value,
                         support_score=row.credibility_score,
                         quoted_span=quote.quote,
                         quote_start=quote.start,
@@ -893,11 +1055,12 @@ class InvestigationRepository:
                     )
                 ).scalars()
             )
-            for row in open_rows:
-                row.status = "resolved"
-                row.resolved_by = raised_by
+            existing_by_key = {(row.claim_id, row.section_id, row.rule): row for row in open_rows}
             created: list[AuditIssueRow] = []
             for issue in issues:
+                key = (issue.get("claim_id"), issue.get("section_id"), str(issue.get("rule") or "agent_audit")[:64])
+                if key in existing_by_key:
+                    continue
                 row = AuditIssueRow(
                     id=self._id(),
                     investigation_id=investigation_id,
@@ -912,6 +1075,7 @@ class InvestigationRepository:
                 )
                 session.add(row)
                 created.append(row)
+                existing_by_key[key] = row
                 session.add(
                     InvestigationEventRow(
                         investigation_id=investigation_id,
@@ -920,7 +1084,50 @@ class InvestigationRepository:
                         payload={"issue_id": row.id, "claim_id": row.claim_id, "severity": row.severity, "rule": row.rule},
                     )
                 )
-        return [self._audit_issue_dict(row) for row in created]
+        return [self._audit_issue_dict(row) for row in [*open_rows, *created]]
+
+    async def resolve_audit_issues(self, investigation_id: str, resolutions: list[dict], *, user_id: str) -> None:
+        async with self._sf() as session, session.begin():
+            investigation = await session.get(InvestigationRow, investigation_id, with_for_update=True)
+            if investigation is None or investigation.user_id != user_id:
+                raise LookupError("Investigation not found")
+            if investigation.status != "auditing":
+                raise InvestigationConflict("Issue resolution requires auditing stage")
+            for resolution in resolutions:
+                issue = await session.get(AuditIssueRow, str(resolution.get("issue_id", "")))
+                if issue is None or issue.investigation_id != investigation_id or issue.status != "open":
+                    continue
+                claim = await session.get(ClaimRow, issue.claim_id) if issue.claim_id else None
+                if claim is None or resolution.get("claim_version") != claim.version or not str(resolution.get("reason", "")).strip():
+                    continue
+                if claim.status not in {"supported", "superseded", "rejected"}:
+                    continue
+                issue.status = "resolved"
+                issue.resolved_by = "evidence-auditor"
+                session.add(InvestigationEventRow(investigation_id=investigation_id, stage="auditing", event_type="ci.audit.resolved", payload={"issue_id": issue.id, "claim_version": claim.version, "reason": resolution["reason"]}))
+
+    async def retire_claim(self, investigation_id: str, claim_id: str, *, user_id: str, expected_version: int, action: str, replacement_ids: list[str]) -> None:
+        if action not in {"revise", "split", "reject"} or (action in {"revise", "split"} and not replacement_ids):
+            raise InvestigationConflict("Invalid Claim revision action")
+        async with self._sf() as session, session.begin():
+            investigation = await session.get(InvestigationRow, investigation_id, with_for_update=True)
+            if investigation is None or investigation.user_id != user_id:
+                raise LookupError("Investigation not found")
+            if investigation.status != "reworking":
+                raise InvestigationConflict("Claim revision requires reworking stage")
+            claim = await session.get(ClaimRow, claim_id)
+            if claim is None or claim.investigation_id != investigation_id or claim.version != expected_version:
+                raise InvestigationConflict("Claim version changed")
+            if claim.status in {"superseded", "rejected"}:
+                return
+            for cid in replacement_ids:
+                replacement = await session.get(ClaimRow, cid)
+                if replacement is None or replacement.investigation_id != investigation_id or replacement.competitor_id != claim.competitor_id or cid == claim_id:
+                    raise InvestigationConflict("Invalid replacement Claim")
+            claim.status = "rejected" if action == "reject" else "superseded"
+            session.add(
+                InvestigationEventRow(investigation_id=investigation_id, stage="reworking", event_type="ci.claim.revised", payload={"claim_id": claim_id, "version": claim.version, "action": action, "replacement_ids": replacement_ids})
+            )
 
     async def begin_audit_rework(self, investigation_id: str, *, user_id: str, issue_ids: list[str]) -> dict[str, Any] | None:
         async with self._sf() as session, session.begin():
@@ -1067,7 +1274,7 @@ class InvestigationRepository:
             for position, section in enumerate(structured_data.get("sections", [])):
                 session.add(
                     ReportSectionRow(
-                        id=str(section.get("id") or self._id()),
+                        id=self._id(),
                         report_id=report.id,
                         section_type=str(section.get("type") or "unknown"),
                         position=position,
@@ -1152,6 +1359,34 @@ class InvestigationRepository:
             if report is None:
                 raise InvestigationConflict("Report version not found")
             if report.status != "published":
+                latest = (await session.execute(select(func.max(ReportRow.version)).where(ReportRow.investigation_id == investigation_id))).scalar_one()
+                if latest != report_version or report.status != "review":
+                    raise InvestigationConflict("Only the latest reviewed report can be published")
+                data = report.structured_data or {}
+                if not data.get("partial") and data.get("schema_version") != "competitive-report-v2":
+                    raise InvestigationConflict("Legacy report requires regeneration with publication quality gates")
+                from app.investigations.quality import claim_is_eligible, coverage_cells
+
+                issue_rows = list((await session.execute(select(AuditIssueRow).where(AuditIssueRow.investigation_id == investigation_id, AuditIssueRow.status == "open"))).scalars())
+                issues = [self._audit_issue_dict(issue) for issue in issue_rows]
+                current_claims = []
+                for cid, version in data.get("claim_versions", {}).items():
+                    claim = await session.get(ClaimRow, cid)
+                    if claim is None or claim.investigation_id != investigation_id or claim.version != version or not claim_is_eligible(self._claim_dict(claim, []), issues):
+                        raise InvestigationConflict("Report Claim eligibility changed; regenerate before publication")
+                    expected_basis = data.get("claim_support_basis", {}).get(cid, "corroborated")
+                    if expected_basis != claim.support_basis:
+                        raise InvestigationConflict("Report source attribution changed; regenerate before publication")
+                    current_claims.append(self._claim_dict(claim, []))
+                if not data.get("partial"):
+                    if data.get("quality_policy_version") == POLICY_VERSION:
+                        scope = (await session.execute(select(ScopeRow).where(ScopeRow.investigation_id == investigation_id))).scalar_one()
+                        competitors = list((await session.execute(select(CompetitorRow).where(CompetitorRow.investigation_id == investigation_id))).scalars())
+                        cells = coverage_cells([{"id": item.id, "name": item.canonical_name} for item in competitors], scope.dimensions, current_claims, issues)
+                        if completion_state(self._serialize(investigation, scope, competitors), cells, current_claims, issues) == "incomplete":
+                            raise InvestigationConflict("Core research requirements remain incomplete")
+                    elif not data.get("claim_versions") or any(cell.get("status") != "covered" for cell in data.get("coverage", [])):
+                        raise InvestigationConflict("Incomplete research cannot publish as a complete report")
                 require_transition(InvestigationStatus(investigation.status), InvestigationStatus.PUBLISHED)
                 now = datetime.now(UTC)
                 report.status, report.approved_at = "published", now
@@ -1218,13 +1453,16 @@ class InvestigationRepository:
                 "time_range": scope.time_range,
                 "competitors": [item.canonical_name for item in competitors],
                 "dimensions": scope.dimensions,
+                "required_dimensions": scope.required_dimensions,
                 "official_domains": {item.canonical_name: item.official_domains for item in competitors if item.official_domains},
+                "official_repositories": {item.canonical_name: item.official_repositories for item in competitors if item.official_repositories},
                 "version": scope.version,
                 "approved_at": scope.approved_at,
             },
             "rework_round": row.rework_round,
             "failure_retry_count": row.failure_retry_count,
             "token_used": row.token_used,
+            "token_reserved": row.token_reserved,
             "token_budget": row.token_budget,
             "deadline_at": row.deadline_at,
             "created_at": row.created_at,
@@ -1266,10 +1504,13 @@ class InvestigationRepository:
             "text": row.text,
             "material": row.material,
             "claim_type": row.claim_type,
+            "version": row.version,
             "evidence_ids": [binding["evidence_id"] for binding in evidence_bindings],
             "evidence_bindings": evidence_bindings,
             "status": row.status,
             "independent_source_count": row.independent_source_count,
+            "support_basis": row.support_basis,
+            "display_text": claim_display_text({"text": row.text, "support_basis": row.support_basis}),
         }
 
     @staticmethod
@@ -1322,5 +1563,6 @@ class InvestigationRepository:
             "status": row.status,
             "raised_by": row.raised_by,
             "resolved_by": row.resolved_by,
+            "blocking": issue_is_blocking({"status": row.status, "severity": row.severity, "rule": row.rule}),
             "created_at": row.created_at,
         }

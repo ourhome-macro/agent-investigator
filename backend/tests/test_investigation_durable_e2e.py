@@ -43,31 +43,42 @@ def _receipt(task, *, run_id=None, batch_id=None, item_id=None, model="scripted"
 
 
 class ScriptedProviders:
+    def __init__(self, missing_initial_beta=False, one_primary=False):
+        self.missing_initial_beta = missing_initial_beta
+        self.one_primary = one_primary
+        self.queries = []
+
     async def search(self, query: str, *, max_results: int):
+        self.queries.append(query)
+        competitor = query.split('"')[1]
+        if self.missing_initial_beta and competitor == "Beta" and "official documentation" not in query:
+            return []
         return [
             SearchHit(
-                title=f"Scripted {index}",
-                url=f"https://source-{index}.example/docs",
-                content=f"Evidence for {query}",
+                title=f"{competitor} documentation {index}",
+                url=f"https://{competitor.casefold()}-{index}.example/docs",
+                content=f"{competitor} supports audited enterprise workflows.",
                 provider="scripted",
             )
-            for index in range(max_results)
+            for index in range(1 if self.one_primary else max_results)
         ]
 
     async def fetch_url(self, url: str, *, fallback_content: str, investigation_id: str):
         del investigation_id
+        competitor = url.split("//")[1].split("-")[0].capitalize()
         return SourceDocument(
             url=url,
-            content=f"Immutable source for {url}. {fallback_content}",
+            content=f"Immutable source for {url}. {competitor} supports audited enterprise workflows.",
             source_type=SourceType.DOCUMENTATION,
             extraction_method="scripted",
         )
 
 
 class ScriptedBatches:
-    def __init__(self, orchestration: OrchestrationRepository, user_id: str) -> None:
+    def __init__(self, orchestration: OrchestrationRepository, user_id: str, overclaim=False) -> None:
         self._orchestration = orchestration
         self._user_id = user_id
+        self.overclaim = overclaim
 
     async def submit(self, *, stage_attempt_id, tasks, **kwargs):
         del kwargs
@@ -78,19 +89,20 @@ class ScriptedBatches:
         submissions = []
         receipts = []
         for task in tasks:
-            if task.stage == StageName.COLLECTING:
+            if task.stage in {StageName.COLLECTING, StageName.REWORKING}:
                 competitor = task.input["competitor"]
                 quote = f"{competitor} supports audited enterprise workflows."
                 payload = {
                     "evidence": [
                         {
-                            "url": f"https://{competitor.casefold()}-{index}.example/docs",
+                            "url": task.input["search_hits"][index - 1]["url"],
                             "title": f"{competitor} source {index}",
                             "excerpt": quote,
                             "source_type": "documentation",
                             "language": "en-US",
+                            "dimension": "功能",
                         }
-                        for index in (1, 2)
+                        for index in range(1, min(2, len(task.input["search_hits"])) + 1)
                     ]
                 }
                 kind = SubmissionKind.EVIDENCE
@@ -108,8 +120,8 @@ class ScriptedBatches:
                 payload = {
                     "claims": [
                         {
-                            "dimension": task.input["dimension"],
-                            "text": "The compared products support audited enterprise workflows.",
+                            "dimension": task.input["dimensions"][0],
+                            "statement": {"subject": task.input["competitor"], "predicate": "supports", "object": "all enterprise workflows." if self.overclaim and task.input["competitor"] == "Acme" else "audited enterprise workflows."},
                             "material": True,
                             "claim_type": "fact",
                             "evidence_bindings": [
@@ -126,6 +138,8 @@ class ScriptedBatches:
                     ]
                 }
                 kind = SubmissionKind.CLAIMS
+                if not chunks:
+                    payload = {"claims": []}
             submission = await self._orchestration.submit_domain_submission(
                 task_id=task.task_id,
                 user_id=self._user_id,
@@ -166,13 +180,37 @@ class ScriptedRuns:
                         "claim_id": claim["id"],
                         "evidence_id": binding["evidence_id"],
                         "relation": binding["relation"],
-                        "verdict": "entails",
+                        "verdict": "partially_supports" if "all enterprise" in claim["text"] else "entails",
                         "reason": "The exact quote directly states the capability.",
                     }
                     for claim in task.input["claims"]
                     for binding in claim["evidence_bindings"]
                 ],
-                "issues": [],
+                "issues": [
+                    {"claim_id": claim["id"], "rule": "overgeneralization", "reason": "The quote only proves audited workflows", "required_action": "revise", "severity": "error"}
+                    for claim in task.input["claims"]
+                    if "all enterprise" in claim["text"]
+                ],
+                "claim_verdicts": [{"claim_id": claim["id"], "atomic": True} for claim in task.input["claims"]],
+                "resolutions": [
+                    {"issue_id": issue["id"], "claim_version": 1, "reason": "Original claim was superseded by a narrower re-audited proposition"}
+                    for issue in task.input.get("open_issues", [])
+                    if issue["claim_id"] in {claim["id"] for claim in task.input.get("retired_claims", [])}
+                ],
+            }
+        elif task.stage == StageName.REWORKING:
+            kind = SubmissionKind.CLAIMS
+            original = task.input["claim"]
+            payload = {
+                "claims": [
+                    {
+                        "dimension": original["dimension"],
+                        "statement": {"subject": task.input["competitor"], "predicate": "supports", "object": "audited enterprise workflows."},
+                        "material": True,
+                        "claim_type": "fact",
+                        "evidence_bindings": [{key: value for key, value in binding.items() if key in {"evidence_id", "relation", "verbatim_quote", "snapshot_sha256"}} for binding in original["evidence_bindings"]],
+                    }
+                ]
             }
         else:
             kind = SubmissionKind.REPORT
@@ -182,8 +220,12 @@ class ScriptedRuns:
                         "id": section_type,
                         "type": section_type,
                         "title": section_type.replace("_", " ").title(),
-                        "markdown": "Structured, evidence-backed section.",
                         "claim_ids": [claim["id"] for claim in task.input["claims"]],
+                        "hypotheses": [
+                            {"hypothesis": "Pilot an audited workflow integration", "premise_claim_ids": [claim["id"] for claim in task.input["claims"]], "validation": "Interview target users and validate a small workflow prototype"}
+                        ]
+                        if section_type == "opportunities"
+                        else [],
                         "evidence_ids": [item["id"] for item in task.input["evidence"]],
                     }
                     for section_type in task.input["required_section_types"]
@@ -199,7 +241,18 @@ class ScriptedRuns:
 
 
 @pytest.mark.asyncio
-async def test_durable_workflow_reaches_publish_review_with_verified_quotes(tmp_path) -> None:
+@pytest.mark.parametrize(
+    "missing_initial_beta,competitor_names,overclaim,one_primary,optional_gap",
+    [
+        (False, ["Acme", "Beta"], False, False, False),
+        (True, ["Acme", "Beta"], False, False, False),
+        (False, ["Acme", "Beta", "Gamma", "Delta", "Epsilon"], False, False, False),
+        (False, ["Acme", "Beta"], True, False, False),
+        (False, ["Acme", "Beta"], False, True, False),
+        (False, ["Acme", "Beta"], False, True, True),
+    ],
+)
+async def test_durable_workflow_reaches_publish_review_with_verified_quotes(tmp_path, missing_initial_beta, competitor_names, overclaim, one_primary, optional_gap) -> None:
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'durable-e2e.db'}")
     try:
         await upgrade_investigation_schema(engine)
@@ -212,16 +265,17 @@ async def test_durable_workflow_reaches_publish_review_with_verified_quotes(tmp_
             InvestigationCreate(
                 title="Acme vs Beta",
                 brief="Compare enterprise workflow capabilities for a buying decision.",
-                scope=ResearchScope(competitors=["Acme", "Beta"], dimensions=["功能"]),
+                scope=ResearchScope(competitors=competitor_names, dimensions=["功能", "定位"] if optional_gap else ["功能"], official_domains={name: [f"{name.casefold()}-0.example"] for name in competitor_names} if one_primary else {}),
             ),
             user_id=user_id,
         )
+        providers = ScriptedProviders(missing_initial_beta, one_primary)
         orchestrator = DurableCompetitiveOrchestrator(
             investigations=investigations,
             orchestration=orchestration,
-            batches=ScriptedBatches(orchestration, user_id),
+            batches=ScriptedBatches(orchestration, user_id, overclaim),
             runs=ScriptedRuns(orchestration, user_id),
-            providers=ScriptedProviders(),
+            providers=providers,
             owner_id=owner_id,
         )
         planning = await orchestration.ensure_workflow(created["id"], user_id=user_id, idempotency_key=f"{created['id']}:planning")
@@ -242,9 +296,26 @@ async def test_durable_workflow_reaches_publish_review_with_verified_quotes(tmp_
         claims = await investigations.list_claims(created["id"], user_id=user_id)
         report = await investigations.latest_report(created["id"], user_id=user_id)
         assert completed is not None and completed["status"] == "awaiting_publish_approval"
-        assert claims is not None and claims[0]["status"] == "supported"
-        assert all(binding["validation_status"] == "verified" for binding in claims[0]["evidence_bindings"])
-        assert all(binding["entailment_status"] == "entails" for binding in claims[0]["evidence_bindings"])
+        assert claims is not None
+        active = [claim for claim in claims if claim["status"] != "superseded"]
+        assert all(claim["status"] == "supported" for claim in active)
+        assert all(binding["validation_status"] == "verified" for claim in active for binding in claim["evidence_bindings"])
+        assert all(binding["entailment_status"] == "entails" for claim in active for binding in claim["evidence_bindings"])
         assert report is not None and len(report["structured_data"]["sections"]) == 11
+        assert report["structured_data"]["partial"] is False
+        assert "| Acme |" in report["rendered_markdown"] and "| Beta |" in report["rendered_markdown"]
+        assert completed["token_reserved"] == 0
+        assert completed["token_used"] <= completed["token_budget"]
+        if missing_initial_beta:
+            assert any('"Beta"' in query and "official documentation" in query for query in providers.queries)
+        if overclaim:
+            assert any(claim["status"] == "superseded" for claim in claims)
+            assert "all enterprise" not in report["rendered_markdown"]
+        if one_primary:
+            assert all(claim["support_basis"] == "official_documented" for claim in active)
+            assert completed["rework_round"] == 0
+            assert not any("official documentation" in query for query in providers.queries)
+        if optional_gap:
+            assert report["structured_data"]["completion_status"] == "completed_with_gaps"
     finally:
         await engine.dispose()

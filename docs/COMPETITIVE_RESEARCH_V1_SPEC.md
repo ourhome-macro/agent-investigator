@@ -1,89 +1,127 @@
-# Competitive Research V1
+# Competitive Research — Current Contract
 
-This document is the implementation contract for the first vertical Deep
-Research product built on DeerFlow. V1 supports only
-`competitive_research`; future investigation kinds must reuse the evidence,
-claim, audit, report, and workflow contracts instead of branching the runtime.
+This is the current product contract for Agent Investigator's
+`competitive_research` workflow. The filename is retained for existing links.
+Historical implementation notes are indexed in [docs/README.md](README.md).
 
-## Product contract
+## Scope and approval
 
-- Single-user pilot with owner-scoped data and a nullable future
-  `organization_id`.
-- Mandatory scope approval before collection and report approval before
-  publication.
-- Chinese and global public-web research plus uploaded documents.
-- Every factual claim has evidence. Material claims require two independent
-  registrable domains or remain `uncertain`.
-- The service stores structured decisions and provenance, never hidden model
-  reasoning.
-- DeepSeek V4 Pro is used for planning/audit/synthesis and V4 Flash for
-  collection/normalization when configured.
+- Owner-scoped investigations; organization-wide collaboration is not yet the
+  product contract.
+- Two to five competitors and one to twelve comparison dimensions.
+- Explicit `required_dimensions` must be a subset of the comparison dimensions.
+  Other gaps may remain documented without making the whole report incomplete.
+- Scope approval precedes collection; report approval precedes publication.
+- Official domains and repository roots are shown at scope approval.
+  A shared hosting domain such as github.com does not establish repository
+  ownership; Issue, forum and user-content pages do not become official product
+  documentation merely by sharing an approved host.
 
-## Workflow
+## Execution
 
-`draft -> planning -> awaiting_scope_approval -> collecting -> normalizing ->
-analyzing -> auditing -> reworking -> synthesizing ->
-awaiting_publish_approval -> published`.
+Planning and report routing use ordinary DeerFlow Runs. Collection and analysis
+use durable batches scoped to competitors. Audit uses ordinary Runs with groups
+of at most four Claims. Rework can collect missing evidence, investigate conflicts,
+revise/split a proposition or retire it; it reuses the same runtime.
 
-Active stages may enter `cancelling -> cancelled`; unrecoverable failures enter
-`failed`. Rework is capped at two rounds. The workflow is code-controlled;
-agents submit validated domain objects through tools and cannot advance stages.
+Application code owns stage transitions:
 
-## Quality gates
+`planning → awaiting_scope_approval → collecting → normalizing → analyzing →
+auditing → reworking (when required) → synthesizing →
+awaiting_publish_approval → published`.
 
-- 2-5 approved competitors, six search angles per competitor.
-- At most 30 accepted evidence records per competitor.
-- 30-minute and 300K-token hard budgets; warning at 80%.
-- Evidence credibility is the deterministic sum of source authority (30),
-  freshness (20), extraction quality (10), specificity (10), and independent
-  corroboration (30).
-- Pricing requires an official source or an explicit third-party-estimate flag.
-- Conflicting evidence is preserved as `contradicts`.
-- Every Claim-Evidence relation contains a verbatim Snapshot substring,
-  offsets, Snapshot SHA-256, validation status, and semantic entailment
-  verdict. Numeric values absent from supporting quotes are rejected.
-- Pricing Claims are generated only from structured PriceObservations whose
-  amount, currency, billing period, and source quote pass exact validation.
-- Analyze uses hybrid BM25 plus semantic-vector retrieval over immutable
-  chunks, with deterministic hashed n-grams only as a development fallback;
-  Audit receives Claim-specific bindings instead of whole documents.
+Failures and cancellation have explicit terminal states. Business rework is
+bounded to two rounds. Optional gaps and non-blocking notes do not cause
+unnecessary automatic rework; missing competitor facts and required dimensions do.
 
-## Delivery
+## Evidence and claims
 
-The dedicated workspace exposes investigation history, scope approval, live
-stages, evidence, claims, audit issues, report review, and Web/Markdown/PDF
-exports. PostgreSQL, Redis-backed streaming/run ownership, DB run events, and
-S3-compatible snapshot storage are required before external production rollout.
+- Search is generated per competitor and dimension. Full text is fetched before
+  candidate selection, and admission decisions plus snapshots are persisted.
+- Candidate selection is balanced across dimensions. Each collector receives a
+  bounded set; evidence application considers at most ten candidates per
+  submission. Counts alone do not prove coverage.
+- The stored excerpt must match the retained snapshot. Fact bindings retain
+  the exact quote, offsets and snapshot hash; invented numbers and mismatched
+  prices are rejected.
+- Analysis uses competitor-scoped retrieval and atomic
+  subject/predicate/object/conditions statements.
+- Price observations include amount, currency, billing period and source quote.
+  Official provenance is derived from approved sources, not trusted from a
+  model's flag.
+- Only verified, entailing bindings count toward support. Conflicting evidence
+  stays visible. Retired claims retain history and cannot silently reappear.
 
-## Implemented vertical slice
+## Source-aware confidence
 
-- Independent fail-fast CI migration chain and persistent `ci_stage_items`.
-- Owner-scoped Investigation, Scope, Evidence, Claim, Event and Report APIs.
-- Lease-fenced workflow recovery with durable task envelopes, submissions, and
-  receipts.
-- Planning/Audit/Synthesis through ordinary DeerFlow Runs; Collect/Analyze and
-  targeted audit rework through Durable Subagent Batches.
-- Bocha, Tavily, Jina and development-only DDGS provider adapters.
-- Deterministic two-domain Claim gate, persisted audit issues, at most two
-  targeted rework rounds, and validated 11-section structured reports.
-- Dedicated workspace with scope/publish approval, rejection/rework, evidence
-  explorer, Claim and audit-issue views, per-Agent item status, Markdown
-  download and browser PDF printing.
-- Production startup rejects missing search or Jina provider credentials.
-- Token usage is recorded in an idempotent budget ledger; early stages reserve
-  20% for Audit/Rework/Synthesis and all execution observes the deadline.
-- Owner-scoped domain submission tools are mandatory for every Run/Batch
-  Agent. Uploads, local/S3-compatible artifacts, and server-side Chromium PDF
-  export share the same Evidence and report provenance.
+`confidence.py` owns sufficiency and attribution:
 
-Before external production rollout, configure the existing DeerFlow database,
-stream bridge, run ownership and run-event settings for PostgreSQL/Redis/DB, and
-provide an S3-compatible implementation for `snapshot_ref`; V1 development
-keeps full extracted excerpts in SQL and leaves `snapshot_ref` optional.
+| Basis | Meaning |
+| --- | --- |
+| `official_documented` | A verified official source states a narrowly scoped product fact or price |
+| `vendor_stated` | Vendor assertion; not independently established performance |
+| `user_reported` | Attributed individual feedback; not prevalence or a universal product fact |
+| `corroborated` | Supporting sources satisfy the corroboration policy |
+| `unverified` / `legacy_unverified` | Not eligible as a confirmed conclusion |
 
-See [Multi-Agent Orchestration](COMPETITIVE_RESEARCH_MULTI_AGENT_ORCHESTRATION.md)
-for scheduling, communication, isolation, validation, retry, and recovery
-semantics.
+There is no universal two-domain requirement. Multiple official domains are
+not independent verification by themselves. Source scores are heuristic
+screening signals, not calibrated correctness probabilities.
 
-See [V1 完成说明](COMPETITIVE_RESEARCH_V1_COMPLETION_ZH.md) for the strict
-evidence, pricing, budget, storage, deployment, and golden-evaluation contract.
+Blocking audit issues prevent the affected Claim from publication; ordinary
+notes do not freeze unrelated claims. An old issue must be explicitly resolved,
+not dropped because a later audit omitted it.
+
+## Report contract
+
+The model selects eligible Claim IDs and may propose labelled hypotheses with
+premises and validation actions. The server renders factual text and comparison
+tables; arbitrary model-authored factual Markdown is not accepted.
+
+Reports expose separate completion and coverage state:
+
+- `completed`: core research requirements are satisfied.
+- `completed_with_gaps`: usable product facts exist for every competitor, while
+  optional questions or notes remain visible.
+- `incomplete`: execution was interrupted, a competitor lacks basic product
+  facts, a required dimension is missing, or a blocking report issue remains.
+
+The eleven-section normal report can contain known gaps. No opportunity
+hypothesis is an acceptable outcome. Interrupted runs produce concise partial
+results rather than duplicating all Claims across report chapters.
+
+Publication rechecks Claim versions, source-basis snapshots and current core
+requirements. Web, Markdown and server-rendered PDF preserve attribution.
+
+## Budgets and recovery
+
+Investigations have a thirty-minute deadline and a 300K–525K token budget scaled
+by competitor count. Stages reserve capacity before dispatch. Non-audit/report
+stages leave twenty percent of capacity for completion work.
+
+Text request preflight conservatively bounds input and caps output before a
+model call. Unknown usage remains charged or reserved. Research batches use one
+execution attempt; workflow recovery/rework obtains fresh budget. Ordinary Runs
+retain initial-plus-two attempts per protocol task.
+
+Stable task inputs, submissions, reservations and execution keys are durable.
+See [orchestration and recovery](COMPETITIVE_RESEARCH_MULTI_AGENT_ORCHESTRATION.md)
+for lease and replay semantics.
+
+## Storage, deployment and verification
+
+The independent migration chain is `alembic_version_ci`, currently through
+`ci_0011`. `ci_0010` adds candidates, budget reservations and submission aliases;
+`ci_0011` adds source basis, approved repositories and required dimensions.
+
+Development can use SQLite, local artifacts and development providers.
+Production requires PostgreSQL, DB Run Events, Redis StreamBridge, durable
+batches, configured search/extraction providers, semantic embeddings and
+S3-compatible storage. Dynamic-page browser extraction must use the guarded
+Playwright path. The supplied Compose overlay provides PostgreSQL and MinIO
+alongside the existing stack.
+
+These implementations do not substitute for a live production acceptance run.
+Current offline results and limitations are recorded in
+[source policy and workspace validation](COMPETITIVE_RESEARCH_CONFIDENCE_AND_WORKSPACE_ZH.md).
+The historical Bilibili run did not complete Audit.

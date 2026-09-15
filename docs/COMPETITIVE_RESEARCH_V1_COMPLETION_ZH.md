@@ -1,8 +1,14 @@
 # Competitive Research V1 完成说明
 
+> 历史阶段记录。本文保留早期实现与连调结论；其中统一双来源、自动重试及旧报告格式已被后续实现调整。当前行为以 [现行规格](COMPETITIVE_RESEARCH_V1_SPEC.md) 和 [来源分级说明](COMPETITIVE_RESEARCH_CONFIDENCE_AND_WORKSPACE_ZH.md) 为准。
+
 本文记录 Deep Research Agent 的 Competitive Research V1 可验收实现。V1
 仍只支持 `competitive_research`，其他 Investigation Type 必须复用同一
 Evidence、Claim、Audit、Workflow 和 Report 内核后再开放。
+
+当前实现已按 [研究闭环改造记录](COMPETITIVE_RESEARCH_CONTROL_LOOP_IMPLEMENTATION_ZH.md)
+升级候选准入、覆盖矩阵、原子结论、分块审计、问题处置与报告门禁。
+本文后部 B站连调记录为历史事实，不表示该次调查已完成审计或通过生产验收。
 
 ## 完整执行链路
 
@@ -139,7 +145,7 @@ SSRF、预算幂等、工具 Owner 隔离、Lease 接管、存储路径逃逸、
 - 检索结果进入 Agent 前移除 Embedding 数组，Audit/Synthesis 使用紧凑 Claim 包；
 - 每个 StageTask 使用独立 Thread，避免 Planning/Audit 历史反复进入上下文；
 - 技术失败次数与业务返工轮次分离，Lease 未到期时延迟重新入队；
-- 预算耗尽或失败时可生成 `partial=true` 的 11 章节不确定性报告；
+- 当时预算耗尽或失败时生成了 `partial=true` 的 11 章节不确定性报告；当前失败交付已改为简明状态、已验证发现和缺口记录；
 - Batch 运行期间同步 Item 状态到工作台。
 
 完整独立报告见

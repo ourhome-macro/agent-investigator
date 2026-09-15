@@ -665,6 +665,11 @@ def build_middlewares(
 
     # TokenBudgetMiddleware - enforce per-run token limits
     token_budget_config = resolved_app_config.token_budget
+    requested_budget = _get_runtime_config(config).get("token_budget_max_tokens")
+    if requested_budget is not None:
+        from deerflow.config.token_budget_config import TokenBudgetConfig
+
+        token_budget_config = TokenBudgetConfig(enabled=True, preflight=True, max_tokens=max(1000, int(requested_budget)))
     if token_budget_config.enabled:
         from deerflow.agents.middlewares.token_budget_middleware import TokenBudgetMiddleware
 
@@ -883,6 +888,16 @@ def _assemble_lead_agent(config: RunnableConfig, *, app_config: AppConfig) -> Le
 
     cfg = _get_runtime_config(config)
     resolved_app_config = app_config
+    bounded_tools = cfg.get("bounded_tool_names")
+    if bounded_tools is not None:
+        resolved_app_config = app_config.model_copy(
+            update={
+                "memory": app_config.memory.model_copy(update={"enabled": False}),
+                "title": app_config.title.model_copy(update={"enabled": False}),
+                "summarization": app_config.summarization.model_copy(update={"enabled": False}),
+                "tool_search": app_config.tool_search.model_copy(update={"enabled": False}),
+            }
+        )
     mode = (config.get("configurable", {}) or {}).get(
         INTERNAL_CHECKPOINT_MODE_KEY,
         resolved_app_config.database.checkpoint_channel_mode,
@@ -920,6 +935,8 @@ def _assemble_lead_agent(config: RunnableConfig, *, app_config: AppConfig) -> Le
     if isinstance(config.get("context"), dict):
         config["context"]["subagent_enabled"] = subagent_enabled
     available_skills = _available_skill_names(agent_config, is_bootstrap)
+    if bounded_tools is not None:
+        available_skills = set()
     # Custom agent model from agent config (if any), or None to let _resolve_model_name pick the default
     agent_model_name = agent_config.model if agent_config and agent_config.model else None
 
@@ -1132,6 +1149,8 @@ def _assemble_lead_agent(config: RunnableConfig, *, app_config: AppConfig) -> Le
     # Default lead agent (unchanged behavior)
     raw_tools = get_available_tools(model_name=model_name, groups=agent_config.tool_groups if agent_config else None, subagent_enabled=subagent_enabled, app_config=resolved_app_config)
     configured_tools = raw_tools + extra_tools
+    if bounded_tools is not None:
+        configured_tools = [tool for tool in configured_tools if tool.name in bounded_tools]
     if non_interactive:
         configured_tools = [tool for tool in configured_tools if tool.name not in _NON_INTERACTIVE_DISABLED_TOOL_NAMES]
     authorization_candidates = [*configured_tools]

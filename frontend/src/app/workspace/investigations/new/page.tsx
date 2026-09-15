@@ -7,12 +7,16 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { createInvestigation } from "@/core/investigations";
+import { readableError } from "@/core/investigations/quality";
+
+const dimensions = ["功能", "定价", "定位", "用户", "壁垒"];
 
 export default function NewInvestigationPage() {
   const router = useRouter();
   const [title, setTitle] = useState("");
   const [brief, setBrief] = useState("");
   const [competitors, setCompetitors] = useState("");
+  const [requiredDimensions, setRequiredDimensions] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
@@ -38,7 +42,8 @@ export default function NewInvestigationPage() {
           language: "zh-CN",
           time_range: "最近12个月",
           competitors: names,
-          dimensions: ["功能", "定价", "定位", "用户", "壁垒"],
+          dimensions,
+          required_dimensions: requiredDimensions,
         },
       });
       window.location.assign(`/workspace/investigations/${created.id}`);
@@ -57,7 +62,7 @@ export default function NewInvestigationPage() {
         <div>
           <h1 className="text-2xl font-semibold">新建竞品深度调研</h1>
           <p className="text-muted-foreground mt-2 text-sm">
-            提交后先确认开题范围，再启动自动采集与审计。
+            先告诉我们要比较哪些产品、准备做什么决策。下一步会让你确认研究范围，再开始查找资料和核对结论。
           </p>
         </div>
         <label className="block space-y-2">
@@ -71,6 +76,9 @@ export default function NewInvestigationPage() {
         </label>
         <label className="block space-y-2">
           <span className="text-sm font-medium">决策背景与目标</span>
+          <p className="text-muted-foreground text-xs">
+            例如：我们想做一款播放器，需要比较离线播放、投屏和收费方式，判断哪些功能值得优先开发。
+          </p>
           <Textarea
             value={brief}
             onChange={(event) => setBrief(event.target.value)}
@@ -90,9 +98,40 @@ export default function NewInvestigationPage() {
             rows={4}
           />
         </label>
-        {error && <p className="text-destructive text-sm">{error}</p>}
+        <fieldset className="space-y-3">
+          <legend className="text-sm font-medium">
+            必须回答的比较项目（可选）
+          </legend>
+          <p className="text-muted-foreground text-xs">
+            勾选后，该项资料不足会标记研究未完成。不勾选时，每个竞品需有基本事实依据，其他信息缺口会在报告中注明。
+          </p>
+          <div className="flex flex-wrap gap-4">
+            {dimensions.map((dimension) => (
+              <label
+                key={dimension}
+                className="flex items-center gap-2 text-sm"
+              >
+                <input
+                  type="checkbox"
+                  checked={requiredDimensions.includes(dimension)}
+                  onChange={(event) =>
+                    setRequiredDimensions((current) =>
+                      event.target.checked
+                        ? [...current, dimension]
+                        : current.filter((item) => item !== dimension),
+                    )
+                  }
+                />
+                {dimension}
+              </label>
+            ))}
+          </div>
+        </fieldset>
+        {error && (
+          <p className="text-destructive text-sm">{readableError(error)}</p>
+        )}
         <Button type="submit" disabled={submitting}>
-          {submitting ? "创建中…" : "生成开题范围"}
+          {submitting ? "创建中…" : "下一步：确认研究范围"}
         </Button>
       </form>
     </main>

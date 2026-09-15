@@ -66,11 +66,14 @@ class DeerFlowRunStageAdapter:
                 assistant_id="lead_agent",
                 prompt=render_stage_prompt(task, instruction),
                 owner_user_id=user_id,
+                token_budget_max_tokens=int(task.input.get("execution_token_cap", 35_000)),
+                bounded_tool_names=["submit_scope", "submit_evidence", "submit_claims", "submit_audit", "submit_report_section"],
                 metadata={
                     "competitive_investigation_id": task.investigation_id,
                     "ci_workflow_run_id": task.workflow_run_id,
                     "ci_stage": task.stage.value,
                     "ci_task_id": task.task_id,
+                    "ci_execution_key": task.input.get("budget_reservation_key"),
                 },
             )
             run_id = str(launched["run_id"])

@@ -150,7 +150,7 @@ class SubagentBatchService:
             items=request.items,
             max_live_items=max_live,
             max_running_items=max_running,
-            max_attempts=self._config.max_attempts,
+            max_attempts=min(self._config.max_attempts, max(1, request.max_attempts)) if request.max_attempts is not None else self._config.max_attempts,
             execution_spec=request.execution_spec,
         )
 
