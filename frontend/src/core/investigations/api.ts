@@ -5,6 +5,7 @@ import type {
   Claim,
   Evidence,
   Investigation,
+  PriceObservation,
   Report,
   ResearchScope,
   StageItem,
@@ -82,6 +83,26 @@ export async function listClaims(id: string): Promise<Claim[]> {
 export async function listAuditIssues(id: string): Promise<AuditIssue[]> {
   return json(
     await fetch(`/api/investigations/${encodeURIComponent(id)}/audit/issues`),
+  );
+}
+
+export async function listPricing(id: string): Promise<PriceObservation[]> {
+  return json(
+    await fetch(`/api/investigations/${encodeURIComponent(id)}/pricing`),
+  );
+}
+
+export async function uploadMaterial(
+  id: string,
+  file: File,
+): Promise<Evidence> {
+  const body = new FormData();
+  body.append("file", file);
+  return json(
+    await fetch(`/api/investigations/${encodeURIComponent(id)}/materials`, {
+      method: "POST",
+      body,
+    }),
   );
 }
 

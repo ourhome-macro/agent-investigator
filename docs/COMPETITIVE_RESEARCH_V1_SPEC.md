@@ -39,6 +39,13 @@ agents submit validated domain objects through tools and cannot advance stages.
   corroboration (30).
 - Pricing requires an official source or an explicit third-party-estimate flag.
 - Conflicting evidence is preserved as `contradicts`.
+- Every Claim-Evidence relation contains a verbatim Snapshot substring,
+  offsets, Snapshot SHA-256, validation status, and semantic entailment
+  verdict. Numeric values absent from supporting quotes are rejected.
+- Pricing Claims are generated only from structured PriceObservations whose
+  amount, currency, billing period, and source quote pass exact validation.
+- Analyze uses hybrid BM25 plus hashed n-gram retrieval over immutable chunks;
+  Audit receives Claim-specific bindings instead of whole documents.
 
 ## Delivery
 
@@ -62,6 +69,11 @@ S3-compatible snapshot storage are required before external production rollout.
   explorer, Claim and audit-issue views, per-Agent item status, Markdown
   download and browser PDF printing.
 - Production startup rejects missing search or Jina provider credentials.
+- Token usage is recorded in an idempotent budget ledger; early stages reserve
+  20% for Audit/Rework/Synthesis and all execution observes the deadline.
+- Owner-scoped domain submission tools are mandatory for every Run/Batch
+  Agent. Uploads, local/S3-compatible artifacts, and server-side Chromium PDF
+  export share the same Evidence and report provenance.
 
 Before external production rollout, configure the existing DeerFlow database,
 stream bridge, run ownership and run-event settings for PostgreSQL/Redis/DB, and
@@ -71,3 +83,6 @@ keeps full extracted excerpts in SQL and leaves `snapshot_ref` optional.
 See [Multi-Agent Orchestration](COMPETITIVE_RESEARCH_MULTI_AGENT_ORCHESTRATION.md)
 for scheduling, communication, isolation, validation, retry, and recovery
 semantics.
+
+See [V1 完成说明](COMPETITIVE_RESEARCH_V1_COMPLETION_ZH.md) for the strict
+evidence, pricing, budget, storage, deployment, and golden-evaluation contract.

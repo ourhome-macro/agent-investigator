@@ -43,7 +43,7 @@ async def test_run_adapter_launches_normal_run_and_accepts_correlated_submission
         stage=task.stage,
         item_key=task.item_key,
         kind=SubmissionKind.AUDIT,
-        payload={"issues": []},
+        payload={"binding_verdicts": [], "issues": []},
     )
     launch_calls = []
     bound = []
@@ -87,7 +87,7 @@ async def test_run_adapter_reuses_persisted_run_and_rejects_wrong_envelope() -> 
         stage=task.stage,
         item_key="wrong-item",
         kind=SubmissionKind.AUDIT,
-        payload={"issues": []},
+        payload={"binding_verdicts": [], "issues": []},
     )
 
     async def launch(**kwargs):

@@ -1674,6 +1674,14 @@ Planning, evidence audit, and synthesis use ordinary DeerFlow Runs. Collection,
 analysis, and targeted evidence rework use durable subagent batches with
 item-level failure isolation and restart recovery.
 
+Factual Claims require exact quotes from immutable Evidence snapshots. Pricing
+uses structured observations with exact amount/currency/period validation.
+The workspace supports user material ingestion, persistent audit verdicts,
+token budgets, and server-generated PDF. A production Compose overlay at
+`docker/docker-compose.deep-research.yaml` adds PostgreSQL and S3-compatible
+MinIO while reusing Redis; production startup fails closed when required
+infrastructure or providers are missing.
+
 Development may fall back to DDGS. Production research requires at least
 `BOCHA_API_KEY` or `TAVILY_API_KEY`; `JINA_API_KEY` enables full-page extraction.
 See [Competitive Research V1](docs/COMPETITIVE_RESEARCH_V1_SPEC.md).

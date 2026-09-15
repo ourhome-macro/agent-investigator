@@ -47,6 +47,18 @@ class ClaimEvidenceRelation(StrEnum):
     CONTEXT = "context"
 
 
+class SourceType(StrEnum):
+    OFFICIAL = "official"
+    PRICING = "pricing"
+    DOCUMENTATION = "documentation"
+    GITHUB = "github"
+    NEWS = "news"
+    REVIEW = "review"
+    FINANCIAL_REPORT = "financial_report"
+    USER_UPLOAD = "user_upload"
+    WEB = "web"
+
+
 class ResearchScope(BaseModel):
     market: str = Field(default="中国+全球", min_length=1, max_length=128)
     audience: str = Field(default="产品与战略团队", min_length=1, max_length=256)
@@ -54,6 +66,7 @@ class ResearchScope(BaseModel):
     time_range: str = Field(default="最近12个月", min_length=1, max_length=128)
     competitors: list[str] = Field(min_length=2, max_length=5)
     dimensions: list[str] = Field(default_factory=lambda: ["功能", "定价", "定位", "用户", "壁垒"], min_length=1, max_length=12)
+    official_domains: dict[str, list[str]] = Field(default_factory=dict)
 
     @field_validator("competitors", "dimensions")
     @classmethod
@@ -71,6 +84,10 @@ class ResearchScope(BaseModel):
             raise ValueError("Scope requires 2-5 unique competitors")
         if not self.dimensions:
             raise ValueError("Scope requires at least one research dimension")
+        competitor_names = {name.casefold() for name in self.competitors}
+        if any(name.casefold() not in competitor_names for name in self.official_domains):
+            raise ValueError("official_domains keys must match scoped competitors")
+        self.official_domains = {name: sorted({domain.strip().lower().removeprefix("www.") for domain in domains if "." in domain}) for name, domains in self.official_domains.items()}
         return self
 
 
@@ -95,6 +112,7 @@ class InvestigationSummary(BaseModel):
     rework_round: int
     token_used: int
     token_budget: int
+    deadline_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -118,15 +136,19 @@ class EvidenceCreate(BaseModel):
     source_url: HttpUrl
     canonical_url: HttpUrl
     source_domain: str = Field(min_length=1, max_length=255)
-    source_type: str = Field(default="web", max_length=32)
+    source_type: SourceType = SourceType.WEB
     title: str = Field(min_length=1, max_length=500)
     publisher: str | None = Field(default=None, max_length=255)
     author: str | None = Field(default=None, max_length=255)
     published_at: datetime | None = None
     retrieved_at: datetime
     excerpt: str = Field(min_length=1, max_length=20_000)
+    snapshot_text: str = Field(min_length=1, max_length=500_000, exclude=True)
+    snapshot_mime_type: str = Field(default="text/plain", max_length=128)
+    extraction_method: str = Field(default="unknown", max_length=64)
     content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     snapshot_ref: str | None = Field(default=None, max_length=1024)
+    original_ref: str | None = Field(default=None, max_length=1024, exclude=True)
     language: str = Field(default="zh-CN", max_length=16)
     source_authority: int = Field(ge=0, le=30)
     freshness: int = Field(ge=0, le=20)
@@ -142,6 +164,32 @@ class EvidenceView(EvidenceCreate):
     credibility_score: int
 
 
+class ClaimEvidenceBinding(BaseModel):
+    evidence_id: str = Field(min_length=8, max_length=64)
+    relation: ClaimEvidenceRelation = ClaimEvidenceRelation.SUPPORTS
+    verbatim_quote: str = Field(min_length=1, max_length=8000)
+    quote_start: int | None = Field(default=None, ge=0)
+    quote_end: int | None = Field(default=None, ge=1)
+    snapshot_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class PriceObservationCreate(BaseModel):
+    evidence_id: str = Field(min_length=8, max_length=64)
+    plan_name: str = Field(min_length=1, max_length=200)
+    amount: str = Field(min_length=1, max_length=64)
+    currency: Literal["CNY", "USD", "EUR", "GBP"]
+    billing_period: Literal["month", "year", "one_time", "usage"]
+    billing_unit: str = Field(default="account", min_length=1, max_length=128)
+    seat_minimum: int | None = Field(default=None, ge=1)
+    region: str | None = Field(default=None, max_length=128)
+    tax_included: bool | None = None
+    promotion: bool = False
+    effective_at: datetime | None = None
+    official: bool
+    verbatim_quote: str = Field(min_length=1, max_length=8000)
+    snapshot_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class ClaimCreate(BaseModel):
     competitor_id: str | None = None
     dimension: str = Field(min_length=1, max_length=64)
@@ -149,6 +197,21 @@ class ClaimCreate(BaseModel):
     material: bool = True
     claim_type: str = Field(default="fact", max_length=32)
     evidence_ids: list[str] = Field(default_factory=list)
+    evidence_bindings: list[ClaimEvidenceBinding] = Field(default_factory=list, max_length=20)
+    price_observations: list[PriceObservationCreate] = Field(default_factory=list, max_length=20)
+
+    @model_validator(mode="after")
+    def require_verbatim_evidence_bindings(self) -> ClaimCreate:
+        binding_ids = [binding.evidence_id for binding in self.evidence_bindings]
+        if len(binding_ids) != len(set(binding_ids)):
+            raise ValueError("Claim evidence bindings must reference unique Evidence IDs")
+        if self.claim_type == "fact" and not self.evidence_bindings:
+            raise ValueError("Factual claims require at least one verbatim Evidence binding")
+        self.evidence_ids = binding_ids
+        price_evidence = {item.evidence_id for item in self.price_observations}
+        if price_evidence - set(binding_ids):
+            raise ValueError("Price observations must reference a bound Evidence record")
+        return self
 
 
 class ClaimView(ClaimCreate):

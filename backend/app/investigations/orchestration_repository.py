@@ -8,8 +8,8 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.investigations.persistence.models import InvestigationRow, StageAttemptRow, StageItemRow, WorkflowRunRow
-from app.investigations.protocols import AgentReceipt, DomainSubmission, StageName, StageTask
+from app.investigations.persistence.models import InvestigationEventRow, InvestigationRow, StageAttemptRow, StageItemRow, WorkflowRunRow
+from app.investigations.protocols import AgentReceipt, DomainSubmission, StageName, StageTask, SubmissionKind
 
 
 class WorkflowLeaseLost(RuntimeError):
@@ -239,6 +239,66 @@ class OrchestrationRepository:
             if row is None or row.submission is None:
                 return None
             return DomainSubmission.model_validate(row.submission)
+
+    async def submit_domain_submission(
+        self,
+        *,
+        task_id: str,
+        user_id: str,
+        kind: SubmissionKind,
+        payload: dict[str, Any],
+        warnings: list[str] | None = None,
+    ) -> DomainSubmission:
+        async with self._sf() as session, session.begin():
+            row = (
+                await session.execute(
+                    select(StageItemRow)
+                    .join(StageAttemptRow, StageAttemptRow.id == StageItemRow.stage_attempt_id)
+                    .join(WorkflowRunRow, WorkflowRunRow.id == StageItemRow.workflow_run_id)
+                    .join(InvestigationRow, InvestigationRow.id == WorkflowRunRow.investigation_id)
+                    .where(
+                        StageItemRow.task_id == task_id,
+                        StageItemRow.status.in_(("pending", "running")),
+                        StageAttemptRow.status == "running",
+                        WorkflowRunRow.status == "running",
+                        InvestigationRow.user_id == user_id,
+                    )
+                    .order_by(StageAttemptRow.attempt.desc())
+                    .limit(1)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                raise LookupError("No active owner-scoped Competitive Research task matches task_id")
+            task = StageTask.model_validate(row.task_envelope)
+            submission = DomainSubmission(
+                task_id=task.task_id,
+                investigation_id=task.investigation_id,
+                workflow_run_id=task.workflow_run_id,
+                stage=task.stage,
+                item_key=task.item_key,
+                kind=kind,
+                payload=payload,
+                warnings=warnings or [],
+            )
+            submission.require_matches(task)
+            if row.submission is not None:
+                existing = DomainSubmission.model_validate(row.submission)
+                if existing != submission:
+                    raise ValueError("Task already has a different DomainSubmission")
+                return existing
+            row.submission = submission.model_dump(mode="json")
+            row.updated_at = datetime.now(UTC)
+            session.add(
+                InvestigationEventRow(
+                    investigation_id=task.investigation_id,
+                    event_type="ci.agent.submission.accepted",
+                    stage=task.stage.value,
+                    task_id=task.task_id,
+                    payload={"item_key": task.item_key, "kind": kind.value},
+                )
+            )
+            return submission
 
     async def finish_stage(self, stage_attempt_id: str, *, succeeded: bool, error: str | None = None) -> None:
         async with self._sf() as session, session.begin():

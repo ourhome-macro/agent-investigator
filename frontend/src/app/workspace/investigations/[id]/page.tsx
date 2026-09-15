@@ -1,6 +1,6 @@
 "use client";
 
-import { Download, ExternalLink, Printer, RefreshCw } from "lucide-react";
+import { Download, ExternalLink, RefreshCw, Upload } from "lucide-react";
 import { useParams } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 
@@ -13,12 +13,15 @@ import {
   listAuditIssues,
   listClaims,
   listEvidence,
+  listPricing,
   listStageItems,
   rejectReport,
+  uploadMaterial,
   type AuditIssue,
   type Claim,
   type Evidence,
   type Investigation,
+  type PriceObservation,
   type Report,
   type StageItem,
 } from "@/core/investigations";
@@ -31,6 +34,7 @@ export default function InvestigationPage() {
   const [evidence, setEvidence] = useState<Evidence[]>([]);
   const [claims, setClaims] = useState<Claim[]>([]);
   const [auditIssues, setAuditIssues] = useState<AuditIssue[]>([]);
+  const [pricing, setPricing] = useState<PriceObservation[]>([]);
   const [report, setReport] = useState<Report | null>(null);
   const [stageItems, setStageItems] = useState<StageItem[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -42,18 +46,21 @@ export default function InvestigationPage() {
         nextEvidence,
         nextClaims,
         nextAuditIssues,
+        nextPricing,
         nextReport,
         nextStageItems,
       ] = await Promise.all([
         listEvidence(id),
         listClaims(id),
         listAuditIssues(id),
+        listPricing(id),
         getLatestReport(id),
         listStageItems(id),
       ]);
       setEvidence(nextEvidence);
       setClaims(nextClaims);
       setAuditIssues(nextAuditIssues);
+      setPricing(nextPricing);
       setReport(nextReport);
       setStageItems(nextStageItems);
       setError(null);
@@ -79,10 +86,38 @@ export default function InvestigationPage() {
             {investigation.brief}
           </p>
         </div>
-        <Button variant="outline" onClick={() => void load()}>
-          <RefreshCw className="size-4" />
-          刷新
-        </Button>
+        <div className="flex gap-2">
+          {[
+            "planning",
+            "awaiting_scope_approval",
+            "collecting",
+            "reworking",
+          ].includes(investigation.status) && (
+            <Button variant="outline" asChild>
+              <label>
+                <Upload className="size-4" />
+                上传材料
+                <input
+                  className="hidden"
+                  type="file"
+                  accept=".txt,.md,.csv,.json,.pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx"
+                  onChange={(event) => {
+                    const file = event.target.files?.[0];
+                    if (file)
+                      void uploadMaterial(id, file)
+                        .then(() => load())
+                        .catch((reason: Error) => setError(reason.message));
+                    event.target.value = "";
+                  }}
+                />
+              </label>
+            </Button>
+          )}
+          <Button variant="outline" onClick={() => void load()}>
+            <RefreshCw className="size-4" />
+            刷新
+          </Button>
+        </div>
       </header>
       {error && (
         <div className="text-destructive rounded-lg border p-3">{error}</div>
@@ -108,7 +143,7 @@ export default function InvestigationPage() {
           </Button>
         </section>
       )}
-      <section className="grid gap-4 md:grid-cols-4">
+      <section className="grid gap-4 md:grid-cols-5">
         {[
           ["证据", evidence.length],
           ["结论", claims.length],
@@ -119,6 +154,10 @@ export default function InvestigationPage() {
           [
             "证据不足",
             claims.filter((item) => item.status === "uncertain").length,
+          ],
+          [
+            "Token 预算",
+            `${investigation.token_used.toLocaleString()} / ${investigation.token_budget.toLocaleString()}`,
           ],
         ].map(([label, value]) => (
           <div key={label} className="rounded-xl border p-4">
@@ -189,6 +228,20 @@ export default function InvestigationPage() {
               独立来源 {claim.independent_source_count} · Evidence{" "}
               {claim.evidence_ids.length}
             </p>
+            <div className="mt-3 space-y-2">
+              {claim.evidence_bindings.map((binding) => (
+                <blockquote
+                  key={`${binding.evidence_id}:${binding.relation}`}
+                  className="border-l-2 pl-3 text-sm"
+                >
+                  <p>“{binding.verbatim_quote}”</p>
+                  <p className="text-muted-foreground mt-1 text-xs">
+                    {binding.relation} · {binding.validation_status} ·{" "}
+                    {binding.entailment_status ?? "pending audit"}
+                  </p>
+                </blockquote>
+              ))}
+            </div>
           </article>
         ))}
       </section>
@@ -212,6 +265,39 @@ export default function InvestigationPage() {
               </p>
             </article>
           ))}
+        </section>
+      )}
+      {pricing.length > 0 && (
+        <section className="space-y-3">
+          <h2 className="text-xl font-medium">结构化定价</h2>
+          <div className="overflow-x-auto rounded-xl border">
+            <table className="w-full text-left text-sm">
+              <thead className="bg-muted">
+                <tr>
+                  <th className="p-3">套餐</th>
+                  <th className="p-3">价格</th>
+                  <th className="p-3">周期</th>
+                  <th className="p-3">单位</th>
+                  <th className="p-3">来源</th>
+                </tr>
+              </thead>
+              <tbody>
+                {pricing.map((item) => (
+                  <tr key={item.id} className="border-t">
+                    <td className="p-3">{item.plan_name}</td>
+                    <td className="p-3">
+                      {item.currency} {item.amount}
+                    </td>
+                    <td className="p-3">{item.billing_period}</td>
+                    <td className="p-3">{item.billing_unit}</td>
+                    <td className="p-3">
+                      {item.official ? "官方" : "第三方估计"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </section>
       )}
       <section className="space-y-3">
@@ -250,9 +336,11 @@ export default function InvestigationPage() {
                   Markdown
                 </a>
               </Button>
-              <Button variant="outline" onClick={() => window.print()}>
-                <Printer className="size-4" />
-                打印 / PDF
+              <Button variant="outline" asChild>
+                <a href={`/api/investigations/${id}/exports/pdf`}>
+                  <Download className="size-4" />
+                  PDF
+                </a>
               </Button>
               {investigation.status === "awaiting_publish_approval" && (
                 <>

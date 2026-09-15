@@ -1,10 +1,20 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Query, Request, Response, status
+import asyncio
+import hashlib
+import re
+import tempfile
+from datetime import UTC, datetime
+from pathlib import Path
+from urllib.parse import quote
+
+from fastapi import APIRouter, File, HTTPException, Query, Request, Response, UploadFile, status
 
 from app.investigations.contracts import ApprovalRequest, ClaimCreate, EvidenceCreate, InvestigationCreate, InvestigationStatus, ReworkRequest, ScopePatch
+from app.investigations.evidence_validation import sha256_text
 from app.investigations.repository import InvestigationConflict, InvestigationRepository
 from deerflow.runtime.user_context import get_effective_user_id
+from deerflow.utils.file_conversion import CONVERTIBLE_EXTENSIONS, convert_file_to_markdown
 
 router = APIRouter(prefix="/api/investigations", tags=["investigations"])
 
@@ -169,6 +179,86 @@ async def list_audit_issues(investigation_id: str, request: Request, status_filt
     return result
 
 
+@router.get("/{investigation_id}/pricing")
+async def list_pricing(investigation_id: str, request: Request):
+    result = await _repo(request).list_price_observations(investigation_id, user_id=_user_id())
+    if result is None:
+        raise _not_found()
+    return result
+
+
+@router.post("/{investigation_id}/materials", status_code=status.HTTP_201_CREATED)
+async def upload_material(investigation_id: str, request: Request, file: UploadFile = File(...)):
+    user_id = _user_id()
+    investigation = await _repo(request).get(investigation_id, user_id=user_id)
+    if investigation is None:
+        raise _not_found()
+    if investigation["status"] not in {"planning", "awaiting_scope_approval", "collecting", "reworking"}:
+        raise HTTPException(status_code=409, detail="Materials cannot be added in the current investigation stage")
+    filename = re.sub(r"[^A-Za-z0-9._\-\u3400-\u9fff]+", "_", Path(file.filename or "material.txt").name)[:180]
+    extension = Path(filename).suffix.lower()
+    allowed = CONVERTIBLE_EXTENSIONS | {".txt", ".md", ".csv", ".json"}
+    if extension not in allowed:
+        raise HTTPException(status_code=415, detail=f"Unsupported research material type: {extension or 'none'}")
+    content = bytearray()
+    while chunk := await file.read(1024 * 1024):
+        content.extend(chunk)
+        if len(content) > 20 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="Research material exceeds the 20 MB limit")
+    storage = getattr(request.app.state, "investigation_artifact_storage", None)
+    if storage is None:
+        raise HTTPException(status_code=503, detail="Investigation artifact storage is unavailable")
+    original_digest = hashlib.sha256(content).hexdigest()
+    original_ref = await storage.put_bytes(
+        f"{investigation_id}/uploads/{original_digest}-{filename}",
+        bytes(content),
+        content_type=file.content_type or "application/octet-stream",
+    )
+    with tempfile.TemporaryDirectory(prefix="deerflow-ci-upload-") as temp_dir:
+        source_path = Path(temp_dir) / filename
+        await asyncio.to_thread(source_path.write_bytes, bytes(content))
+        if extension in {".txt", ".md", ".csv", ".json"}:
+            extracted = bytes(content).decode("utf-8", errors="replace")
+            extraction_method = "utf8_upload"
+        else:
+            converted_path = await convert_file_to_markdown(source_path)
+            if converted_path is None:
+                raise HTTPException(status_code=422, detail="Research material conversion failed")
+            extracted = await asyncio.to_thread(converted_path.read_text, encoding="utf-8")
+            extraction_method = "markitdown_upload"
+    extracted = extracted.strip()
+    if len(extracted) < 20:
+        raise HTTPException(status_code=422, detail="Research material contains too little extractable text")
+    synthetic_url = f"https://uploads.invalid/{investigation_id}/{quote(filename)}"
+    try:
+        result = await _repo(request).add_evidence(
+            investigation_id,
+            EvidenceCreate(
+                source_url=synthetic_url,
+                canonical_url=synthetic_url,
+                source_domain="uploads.invalid",
+                source_type="user_upload",
+                title=filename,
+                retrieved_at=datetime.now(UTC),
+                excerpt=extracted[:20_000],
+                snapshot_text=extracted,
+                content_hash=sha256_text(extracted),
+                extraction_method=extraction_method,
+                original_ref=original_ref,
+                source_authority=18,
+                freshness=10,
+                extraction_quality=8,
+                specificity=7,
+                corroboration=0,
+            ),
+            user_id=user_id,
+            agent_name="user-upload",
+        )
+    except InvestigationConflict as exc:
+        raise _conflict(exc) from exc
+    return result
+
+
 @router.get("/{investigation_id}/reports/latest")
 async def latest_report(investigation_id: str, request: Request):
     report = await _repo(request).latest_report(investigation_id, user_id=_user_id())
@@ -238,8 +328,31 @@ async def export_report(investigation_id: str, export_format: str, request: Requ
     report = await _repo(request).latest_report(investigation_id, user_id=_user_id())
     if report is None:
         raise HTTPException(status_code=404, detail="Report not found")
-    if export_format != "markdown":
+    if export_format not in {"markdown", "pdf"}:
         raise HTTPException(status_code=422, detail="Unsupported export format")
+    if export_format == "pdf":
+        from app.investigations.exports import PdfExportUnavailable
+
+        service = getattr(request.app.state, "investigation_export_service", None)
+        if service is None:
+            raise HTTPException(status_code=503, detail="PDF export service is unavailable")
+        try:
+            content, object_ref, digest = await service.render_pdf(investigation_id, report)
+        except PdfExportUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        await _repo(request).record_export(
+            investigation_id,
+            report_id=report["id"],
+            export_format="pdf",
+            object_ref=object_ref,
+            content_hash=digest,
+            user_id=_user_id(),
+        )
+        return Response(
+            content=content,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="competitive-research-{investigation_id}-v{report["version"]}.pdf"'},
+        )
     filename = f"competitive-research-{investigation_id}-v{report['version']}.md"
     return Response(
         content=report["rendered_markdown"],

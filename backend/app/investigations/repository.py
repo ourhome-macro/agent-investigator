@@ -18,29 +18,56 @@ from app.investigations.contracts import (
     InvestigationStatus,
     ResearchScope,
 )
+from app.investigations.evidence_validation import (
+    EvidenceValidationError,
+    locate_verbatim_quote,
+    require_claim_values_in_quotes,
+    require_price_fields_in_quote,
+    sha256_text,
+)
 from app.investigations.persistence.models import (
     AuditIssueRow,
+    BudgetEntryRow,
     ClaimEvidenceRow,
     ClaimRow,
     CompetitorRow,
+    EvidenceChunkRow,
     EvidenceRow,
+    EvidenceSnapshotRow,
+    ExportRow,
     InvestigationEventRow,
     InvestigationRow,
+    PriceObservationRow,
     ReportRow,
     ReportSectionRow,
     ScopeRow,
 )
+from app.investigations.retrieval import chunk_snapshot, hashed_embedding, rank_chunks
 from app.investigations.scoring import credibility_score, independent_source_count
 from app.investigations.state_machine import require_transition
+from app.investigations.storage import ArtifactStorage
 
 
 class InvestigationConflict(ValueError):
     pass
 
 
+class InvestigationBudgetExceeded(RuntimeError):
+    pass
+
+
+class InvestigationDeadlineExceeded(RuntimeError):
+    pass
+
+
+def _utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
 class InvestigationRepository:
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession], *, artifact_storage: ArtifactStorage | None = None) -> None:
         self._sf = session_factory
+        self._artifact_storage = artifact_storage
 
     @staticmethod
     def _id() -> str:
@@ -77,7 +104,14 @@ class InvestigationRepository:
             )
             session.add_all([row, scope])
             for name in request.scope.competitors:
-                session.add(CompetitorRow(id=self._id(), investigation_id=investigation_id, canonical_name=name))
+                session.add(
+                    CompetitorRow(
+                        id=self._id(),
+                        investigation_id=investigation_id,
+                        canonical_name=name,
+                        official_domains=request.scope.official_domains.get(name, []),
+                    )
+                )
             session.add(
                 InvestigationEventRow(
                     investigation_id=investigation_id,
@@ -110,7 +144,7 @@ class InvestigationRepository:
             return None
         async with self._sf() as session:
             rows = list((await session.execute(select(CompetitorRow).where(CompetitorRow.investigation_id == investigation_id).order_by(CompetitorRow.created_at))).scalars())
-            return [{"id": row.id, "name": row.canonical_name} for row in rows]
+            return [{"id": row.id, "name": row.canonical_name, "official_domains": row.official_domains} for row in rows]
 
     async def list_recoverable(self) -> list[tuple[str, str]]:
         statuses = [
@@ -124,6 +158,97 @@ class InvestigationRepository:
         async with self._sf() as session:
             rows = await session.execute(select(InvestigationRow.id, InvestigationRow.user_id).where(InvestigationRow.status.in_(statuses)))
             return [(row.id, row.user_id) for row in rows]
+
+    async def assert_execution_budget(
+        self,
+        investigation_id: str,
+        *,
+        user_id: str,
+        stage: str,
+        estimated_tokens: int,
+    ) -> dict[str, int]:
+        async with self._sf() as session:
+            investigation = await session.get(InvestigationRow, investigation_id)
+            if investigation is None or investigation.user_id != user_id:
+                raise LookupError("Investigation not found")
+            now = datetime.now(UTC)
+            if investigation.deadline_at is not None and _utc(investigation.deadline_at) <= now:
+                raise InvestigationDeadlineExceeded("Investigation deadline has expired")
+            reserve_stages = {"auditing", "reworking", "synthesizing"}
+            usable_budget = investigation.token_budget if stage in reserve_stages else int(investigation.token_budget * 0.8)
+            if investigation.token_used + max(0, estimated_tokens) > usable_budget:
+                raise InvestigationBudgetExceeded(f"Stage {stage} would exceed its token budget: used={investigation.token_used}, estimated={estimated_tokens}, usable={usable_budget}")
+            return {
+                "used": investigation.token_used,
+                "budget": investigation.token_budget,
+                "usable": usable_budget,
+                "remaining": max(0, usable_budget - investigation.token_used),
+            }
+
+    async def record_token_usage(
+        self,
+        investigation_id: str,
+        *,
+        user_id: str,
+        workflow_run_id: str | None,
+        stage: str,
+        task_id: str | None,
+        run_id: str | None,
+        durable_batch_id: str | None,
+        model_name: str | None,
+        token_usage: dict[str, Any] | None,
+        idempotency_key: str,
+    ) -> dict[str, int]:
+        usage = token_usage or {}
+        input_tokens = max(0, int(usage.get("input_tokens") or 0))
+        output_tokens = max(0, int(usage.get("output_tokens") or 0))
+        total_tokens = max(0, int(usage.get("total_tokens") or input_tokens + output_tokens))
+        async with self._sf() as session, session.begin():
+            investigation = await session.get(InvestigationRow, investigation_id, with_for_update=True)
+            if investigation is None or investigation.user_id != user_id:
+                raise LookupError("Investigation not found")
+            existing = (await session.execute(select(BudgetEntryRow).where(BudgetEntryRow.idempotency_key == idempotency_key))).scalar_one_or_none()
+            if existing is not None:
+                return {"used": investigation.token_used, "budget": investigation.token_budget}
+            previous = investigation.token_used
+            investigation.token_used += total_tokens
+            session.add(
+                BudgetEntryRow(
+                    id=self._id(),
+                    investigation_id=investigation_id,
+                    workflow_run_id=workflow_run_id,
+                    stage=stage,
+                    task_id=task_id,
+                    run_id=run_id,
+                    durable_batch_id=durable_batch_id,
+                    model_name=model_name,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    total_tokens=total_tokens,
+                    idempotency_key=idempotency_key,
+                )
+            )
+            if previous < int(investigation.token_budget * 0.8) <= investigation.token_used:
+                session.add(
+                    InvestigationEventRow(
+                        investigation_id=investigation_id,
+                        event_type="ci.budget.warning",
+                        stage=stage,
+                        task_id=task_id,
+                        payload={"used": investigation.token_used, "budget": investigation.token_budget},
+                    )
+                )
+            if previous < investigation.token_budget <= investigation.token_used:
+                session.add(
+                    InvestigationEventRow(
+                        investigation_id=investigation_id,
+                        event_type="ci.budget.exhausted",
+                        stage=stage,
+                        task_id=task_id,
+                        payload={"used": investigation.token_used, "budget": investigation.token_budget},
+                    )
+                )
+        return {"used": investigation.token_used, "budget": investigation.token_budget}
 
     async def update_scope(self, investigation_id: str, scope: ResearchScope, *, expected_version: int, user_id: str) -> dict[str, Any] | None:
         async with self._sf() as session, session.begin():
@@ -139,7 +264,17 @@ class InvestigationRepository:
             row.market, row.audience, row.language, row.time_range = scope.market, scope.audience, scope.language, scope.time_range
             row.dimensions, row.updated_at = scope.dimensions, datetime.now(UTC)
             await session.execute(CompetitorRow.__table__.delete().where(CompetitorRow.investigation_id == investigation_id))
-            session.add_all([CompetitorRow(id=self._id(), investigation_id=investigation_id, canonical_name=name) for name in scope.competitors])
+            session.add_all(
+                [
+                    CompetitorRow(
+                        id=self._id(),
+                        investigation_id=investigation_id,
+                        canonical_name=name,
+                        official_domains=scope.official_domains.get(name, []),
+                    )
+                    for name in scope.competitors
+                ]
+            )
             investigation.updated_at = datetime.now(UTC)
         return await self.get(investigation_id, user_id=user_id)
 
@@ -159,7 +294,17 @@ class InvestigationRepository:
             scope_row.dimensions = scope.dimensions
             scope_row.updated_at = datetime.now(UTC)
             await session.execute(CompetitorRow.__table__.delete().where(CompetitorRow.investigation_id == investigation_id))
-            session.add_all([CompetitorRow(id=self._id(), investigation_id=investigation_id, canonical_name=name) for name in scope.competitors])
+            session.add_all(
+                [
+                    CompetitorRow(
+                        id=self._id(),
+                        investigation_id=investigation_id,
+                        canonical_name=name,
+                        official_domains=scope.official_domains.get(name, []),
+                    )
+                    for name in scope.competitors
+                ]
+            )
             require_transition(InvestigationStatus.PLANNING, InvestigationStatus.AWAITING_SCOPE_APPROVAL)
             investigation.status = InvestigationStatus.AWAITING_SCOPE_APPROVAL.value
             investigation.updated_at = datetime.now(UTC)
@@ -201,6 +346,24 @@ class InvestigationRepository:
         return await self.get(investigation_id, user_id=user_id)
 
     async def add_evidence(self, investigation_id: str, request: EvidenceCreate, *, user_id: str, agent_name: str | None = None) -> dict[str, Any] | None:
+        if sha256_text(request.snapshot_text) != request.content_hash:
+            raise InvestigationConflict("Evidence content_hash does not match snapshot_text")
+        try:
+            quote_match = locate_verbatim_quote(request.snapshot_text, request.excerpt)
+        except EvidenceValidationError as exc:
+            raise InvestigationConflict(str(exc)) from exc
+        allowed_stages = {
+            InvestigationStatus.PLANNING.value,
+            InvestigationStatus.AWAITING_SCOPE_APPROVAL.value,
+            InvestigationStatus.COLLECTING.value,
+            InvestigationStatus.REWORKING.value,
+        }
+        async with self._sf() as session:
+            investigation = await session.get(InvestigationRow, investigation_id)
+            if investigation is None or investigation.user_id != user_id:
+                return None
+            if investigation.status not in allowed_stages:
+                raise InvestigationConflict("Evidence can only be submitted before publication analysis or during rework")
         components = {
             "source_authority": request.source_authority,
             "freshness": request.freshness,
@@ -209,38 +372,92 @@ class InvestigationRepository:
             "corroboration": request.corroboration,
         }
         score = credibility_score(**components)
-        row = EvidenceRow(
-            id=self._id(),
-            investigation_id=investigation_id,
-            competitor_id=request.competitor_id,
-            source_url=str(request.source_url),
-            canonical_url=str(request.canonical_url),
-            source_domain=request.source_domain,
-            source_type=request.source_type,
-            title=request.title,
-            publisher=request.publisher,
-            author=request.author,
-            published_at=request.published_at,
-            retrieved_at=request.retrieved_at,
-            excerpt=request.excerpt,
-            content_hash=request.content_hash,
-            snapshot_ref=request.snapshot_ref,
-            language=request.language,
-            credibility_score=score,
-            score_components=components,
-            status=request.status.value,
-            created_by_agent=agent_name,
-        )
+        object_ref = request.snapshot_ref
+        if self._artifact_storage is not None:
+            object_ref = await self._artifact_storage.put_bytes(
+                f"{investigation_id}/snapshots/{request.content_hash}.txt",
+                request.snapshot_text.encode("utf-8"),
+                content_type=request.snapshot_mime_type,
+            )
         try:
             async with self._sf() as session, session.begin():
                 investigation = await session.get(InvestigationRow, investigation_id, with_for_update=True)
                 if investigation is None or investigation.user_id != user_id:
                     return None
-                if investigation.status not in {
-                    InvestigationStatus.COLLECTING.value,
-                    InvestigationStatus.REWORKING.value,
-                }:
-                    raise InvestigationConflict("Evidence can only be submitted during collecting or reworking")
+                if investigation.status not in allowed_stages:
+                    raise InvestigationConflict("Evidence can only be submitted before publication analysis or during rework")
+                existing = (
+                    await session.execute(
+                        select(EvidenceRow).where(
+                            EvidenceRow.investigation_id == investigation_id,
+                            EvidenceRow.content_hash == request.content_hash,
+                        )
+                    )
+                ).scalar_one_or_none()
+                if existing is not None:
+                    return self._evidence_dict(existing)
+                snapshot = (
+                    await session.execute(
+                        select(EvidenceSnapshotRow).where(
+                            EvidenceSnapshotRow.investigation_id == investigation_id,
+                            EvidenceSnapshotRow.content_hash == request.content_hash,
+                        )
+                    )
+                ).scalar_one_or_none()
+                if snapshot is None:
+                    snapshot = EvidenceSnapshotRow(
+                        id=self._id(),
+                        investigation_id=investigation_id,
+                        source_url=str(request.canonical_url),
+                        content_text=request.snapshot_text,
+                        content_hash=request.content_hash,
+                        mime_type=request.snapshot_mime_type,
+                        extraction_method=request.extraction_method,
+                        language=request.language,
+                        object_ref=object_ref,
+                        original_ref=request.original_ref,
+                    )
+                    session.add(snapshot)
+                    await session.flush()
+                    session.add_all(
+                        [
+                            EvidenceChunkRow(
+                                id=self._id(),
+                                snapshot_id=snapshot.id,
+                                ordinal=chunk.ordinal,
+                                char_start=chunk.char_start,
+                                char_end=chunk.char_end,
+                                content=chunk.content,
+                                content_hash=chunk.content_hash,
+                                token_estimate=chunk.token_estimate,
+                                embedding=hashed_embedding(chunk.content),
+                            )
+                            for chunk in chunk_snapshot(request.snapshot_text)
+                        ]
+                    )
+                row = EvidenceRow(
+                    id=self._id(),
+                    snapshot_id=snapshot.id,
+                    investigation_id=investigation_id,
+                    competitor_id=request.competitor_id,
+                    source_url=str(request.source_url),
+                    canonical_url=str(request.canonical_url),
+                    source_domain=request.source_domain,
+                    source_type=request.source_type.value,
+                    title=request.title,
+                    publisher=request.publisher,
+                    author=request.author,
+                    published_at=request.published_at,
+                    retrieved_at=request.retrieved_at,
+                    excerpt=quote_match.quote,
+                    content_hash=request.content_hash,
+                    snapshot_ref=object_ref or snapshot.id,
+                    language=request.language,
+                    credibility_score=score,
+                    score_components=components,
+                    status=request.status.value,
+                    created_by_agent=agent_name,
+                )
                 session.add(row)
                 session.add(
                     InvestigationEventRow(
@@ -293,27 +510,55 @@ class InvestigationRepository:
             if idempotency_key is not None:
                 existing = (await session.execute(select(ClaimRow).where(ClaimRow.idempotency_key == idempotency_key))).scalar_one_or_none()
                 if existing is not None:
-                    links = list((await session.execute(select(ClaimEvidenceRow.evidence_id).where(ClaimEvidenceRow.claim_id == existing.id))).scalars())
-                    return self._claim_dict(existing, links)
-            evidence_rows = (
-                list(
-                    (
-                        await session.execute(
-                            select(EvidenceRow).where(
-                                EvidenceRow.investigation_id == investigation_id,
-                                EvidenceRow.id.in_(request.evidence_ids),
-                                EvidenceRow.status == EvidenceStatus.ACTIVE.value,
-                            )
+                    links = list((await session.execute(select(ClaimEvidenceRow).where(ClaimEvidenceRow.claim_id == existing.id))).scalars())
+                    return self._claim_dict(existing, [self._claim_link_dict(link) for link in links])
+            binding_by_id = {binding.evidence_id: binding for binding in request.evidence_bindings}
+            evidence_rows = list(
+                (
+                    await session.execute(
+                        select(EvidenceRow).where(
+                            EvidenceRow.investigation_id == investigation_id,
+                            EvidenceRow.id.in_(binding_by_id),
+                            EvidenceRow.status == EvidenceStatus.ACTIVE.value,
                         )
-                    ).scalars()
-                )
-                if request.evidence_ids
-                else []
+                    )
+                ).scalars()
             )
-            if len(evidence_rows) != len(set(request.evidence_ids)):
+            if len(evidence_rows) != len(binding_by_id):
                 raise InvestigationConflict("Claim references missing or inactive evidence")
-            count = independent_source_count(row.source_domain for row in evidence_rows)
-            status = ClaimStatus.SUPPORTED if count >= (2 if request.material else 1) else ClaimStatus.UNCERTAIN
+            validated_links: list[tuple[EvidenceRow, Any, Any]] = []
+            for evidence in evidence_rows:
+                binding = binding_by_id[evidence.id]
+                if evidence.snapshot_id is None:
+                    raise InvestigationConflict("Claim references legacy Evidence without an immutable snapshot")
+                snapshot = await session.get(EvidenceSnapshotRow, evidence.snapshot_id)
+                if snapshot is None or snapshot.content_hash != binding.snapshot_sha256:
+                    raise InvestigationConflict("Claim binding snapshot hash does not match Evidence")
+                if request.material and binding.relation == ClaimEvidenceRelation.SUPPORTS and snapshot.extraction_method == "search_snippet":
+                    raise InvestigationConflict("Material Claims cannot rely on a search snippet as supporting Evidence")
+                try:
+                    quote = locate_verbatim_quote(snapshot.content_text, binding.verbatim_quote)
+                except EvidenceValidationError as exc:
+                    raise InvestigationConflict(str(exc)) from exc
+                if binding.quote_start is not None and binding.quote_start != quote.start:
+                    raise InvestigationConflict("Claim binding quote_start does not match the immutable snapshot")
+                if binding.quote_end is not None and binding.quote_end != quote.end:
+                    raise InvestigationConflict("Claim binding quote_end does not match the immutable snapshot")
+                validated_links.append((evidence, binding, quote))
+            supporting = [item for item in validated_links if item[1].relation == ClaimEvidenceRelation.SUPPORTS]
+            contradicting = [item for item in validated_links if item[1].relation == ClaimEvidenceRelation.CONTRADICTS]
+            try:
+                require_claim_values_in_quotes(request.text, [item[2].quote for item in supporting])
+            except EvidenceValidationError as exc:
+                raise InvestigationConflict(str(exc)) from exc
+            count = independent_source_count(item[0].source_domain for item in supporting)
+            if contradicting:
+                status = ClaimStatus.CONTRADICTED if not supporting else ClaimStatus.UNCERTAIN
+            else:
+                status = ClaimStatus.UNCERTAIN
+            pricing_dimension = request.claim_type == "pricing" or request.dimension.casefold() in {"pricing", "定价", "价格"}
+            if pricing_dimension and not request.price_observations:
+                raise InvestigationConflict("Pricing claims require at least one structured PriceObservation")
             claim = ClaimRow(
                 id=self._id(),
                 idempotency_key=idempotency_key,
@@ -334,13 +579,66 @@ class InvestigationRepository:
                 [
                     ClaimEvidenceRow(
                         claim_id=claim.id,
-                        evidence_id=row.id,
-                        relation=ClaimEvidenceRelation.SUPPORTS.value,
-                        support_score=row.credibility_score,
+                        evidence_id=evidence.id,
+                        relation=binding.relation.value,
+                        support_score=evidence.credibility_score,
+                        quoted_span=quote.quote,
+                        quote_start=quote.start,
+                        quote_end=quote.end,
+                        snapshot_sha256=quote.snapshot_sha256,
+                        validation_status="verified",
+                        entailment_status="pending_audit",
                     )
-                    for row in evidence_rows
+                    for evidence, binding, quote in validated_links
                 ]
             )
+            evidence_by_id = {row.id: row for row in evidence_rows}
+            for price in request.price_observations:
+                evidence = evidence_by_id[price.evidence_id]
+                official_domains: list[str] = []
+                if evidence.competitor_id:
+                    competitor = await session.get(CompetitorRow, evidence.competitor_id)
+                    if competitor is not None:
+                        official_domains = competitor.official_domains
+                verified_official = any(evidence.source_domain == domain or evidence.source_domain.endswith(f".{domain}") for domain in official_domains)
+                if price.official and not verified_official:
+                    raise InvestigationConflict("Official PriceObservation domain is not approved in the research scope")
+                try:
+                    require_price_fields_in_quote(
+                        amount=price.amount,
+                        currency=price.currency,
+                        billing_period=price.billing_period,
+                        quote=price.verbatim_quote,
+                    )
+                    price_quote = locate_verbatim_quote(
+                        (await session.get(EvidenceSnapshotRow, evidence.snapshot_id)).content_text,
+                        price.verbatim_quote,
+                    )
+                except EvidenceValidationError as exc:
+                    raise InvestigationConflict(str(exc)) from exc
+                if price_quote.snapshot_sha256 != price.snapshot_sha256:
+                    raise InvestigationConflict("PriceObservation snapshot hash does not match Evidence")
+                session.add(
+                    PriceObservationRow(
+                        id=self._id(),
+                        investigation_id=investigation_id,
+                        claim_id=claim.id,
+                        evidence_id=evidence.id,
+                        plan_name=price.plan_name,
+                        amount=price.amount,
+                        currency=price.currency,
+                        billing_period=price.billing_period,
+                        billing_unit=price.billing_unit,
+                        seat_minimum=price.seat_minimum,
+                        region=price.region,
+                        tax_included=price.tax_included,
+                        promotion=price.promotion,
+                        effective_at=price.effective_at,
+                        official=price.official,
+                        verbatim_quote=price_quote.quote,
+                        snapshot_sha256=price_quote.snapshot_sha256,
+                    )
+                )
             session.add(
                 InvestigationEventRow(
                     investigation_id=investigation_id,
@@ -349,7 +647,22 @@ class InvestigationRepository:
                     payload={"claim_id": claim.id, "status": status.value, "independent_sources": count},
                 )
             )
-        return self._claim_dict(claim, request.evidence_ids)
+        return self._claim_dict(
+            claim,
+            [
+                {
+                    "evidence_id": evidence.id,
+                    "relation": binding.relation.value,
+                    "verbatim_quote": quote.quote,
+                    "quote_start": quote.start,
+                    "quote_end": quote.end,
+                    "snapshot_sha256": quote.snapshot_sha256,
+                    "validation_status": "verified",
+                    "entailment_status": "pending_audit",
+                }
+                for evidence, binding, quote in validated_links
+            ],
+        )
 
     async def list_claims(self, investigation_id: str, *, user_id: str) -> list[dict[str, Any]] | None:
         if await self.get(investigation_id, user_id=user_id) is None:
@@ -357,10 +670,111 @@ class InvestigationRepository:
         async with self._sf() as session:
             rows = list((await session.execute(select(ClaimRow).where(ClaimRow.investigation_id == investigation_id).order_by(ClaimRow.created_at))).scalars())
             links = list((await session.execute(select(ClaimEvidenceRow).join(ClaimRow, ClaimRow.id == ClaimEvidenceRow.claim_id).where(ClaimRow.investigation_id == investigation_id))).scalars())
-            by_claim: dict[str, list[str]] = {}
+            by_claim: dict[str, list[dict[str, Any]]] = {}
             for link in links:
-                by_claim.setdefault(link.claim_id, []).append(link.evidence_id)
+                by_claim.setdefault(link.claim_id, []).append(self._claim_link_dict(link))
             return [self._claim_dict(row, by_claim.get(row.id, [])) for row in rows]
+
+    async def list_price_observations(self, investigation_id: str, *, user_id: str) -> list[dict[str, Any]] | None:
+        if await self.get(investigation_id, user_id=user_id) is None:
+            return None
+        async with self._sf() as session:
+            rows = list((await session.execute(select(PriceObservationRow).where(PriceObservationRow.investigation_id == investigation_id).order_by(PriceObservationRow.created_at))).scalars())
+            return [self._price_observation_dict(row) for row in rows]
+
+    async def apply_audit_verdicts(
+        self,
+        investigation_id: str,
+        verdicts: list[dict[str, Any]],
+        *,
+        user_id: str,
+        auditor: str,
+    ) -> None:
+        allowed = {"entails", "partially_supports", "contradicts", "unrelated"}
+        async with self._sf() as session, session.begin():
+            investigation = await session.get(InvestigationRow, investigation_id, with_for_update=True)
+            if investigation is None or investigation.user_id != user_id:
+                raise LookupError("Investigation not found")
+            if investigation.status != InvestigationStatus.AUDITING.value:
+                raise InvestigationConflict("Binding verdicts can only be submitted during auditing")
+            for verdict in verdicts:
+                status = str(verdict.get("verdict") or "")
+                if status not in allowed:
+                    continue
+                link = await session.get(
+                    ClaimEvidenceRow,
+                    (
+                        str(verdict.get("claim_id") or ""),
+                        str(verdict.get("evidence_id") or ""),
+                        str(verdict.get("relation") or ClaimEvidenceRelation.SUPPORTS.value),
+                    ),
+                    with_for_update=True,
+                )
+                if link is None:
+                    continue
+                claim = await session.get(ClaimRow, link.claim_id)
+                if claim is None or claim.investigation_id != investigation_id:
+                    continue
+                link.entailment_status = status
+                link.auditor_status = auditor
+
+            claims = list((await session.execute(select(ClaimRow).where(ClaimRow.investigation_id == investigation_id))).scalars())
+            for claim in claims:
+                rows = list((await session.execute(select(ClaimEvidenceRow, EvidenceRow).join(EvidenceRow, EvidenceRow.id == ClaimEvidenceRow.evidence_id).where(ClaimEvidenceRow.claim_id == claim.id))).all())
+                supporting_domains = [evidence.source_domain for link, evidence in rows if link.relation == ClaimEvidenceRelation.SUPPORTS.value and link.entailment_status == "entails"]
+                has_contradiction = any(link.entailment_status == "contradicts" or link.relation == ClaimEvidenceRelation.CONTRADICTS.value for link, _ in rows)
+                count = independent_source_count(supporting_domains)
+                claim.independent_source_count = count
+                if has_contradiction:
+                    claim.status = ClaimStatus.CONTRADICTED.value if count == 0 else ClaimStatus.UNCERTAIN.value
+                else:
+                    claim.status = (ClaimStatus.SUPPORTED if count >= (2 if claim.material else 1) else ClaimStatus.UNCERTAIN).value
+
+    async def retrieve_context(
+        self,
+        investigation_id: str,
+        *,
+        user_id: str,
+        query: str,
+        limit: int = 12,
+    ) -> list[dict[str, Any]] | None:
+        if await self.get(investigation_id, user_id=user_id) is None:
+            return None
+        async with self._sf() as session:
+            rows = list(
+                (
+                    await session.execute(
+                        select(
+                            EvidenceChunkRow,
+                            EvidenceRow.id,
+                            EvidenceRow.source_domain,
+                            EvidenceRow.source_type,
+                            EvidenceSnapshotRow.content_hash,
+                        )
+                        .join(EvidenceSnapshotRow, EvidenceSnapshotRow.id == EvidenceChunkRow.snapshot_id)
+                        .join(EvidenceRow, EvidenceRow.snapshot_id == EvidenceSnapshotRow.id)
+                        .where(EvidenceRow.investigation_id == investigation_id, EvidenceRow.status == EvidenceStatus.ACTIVE.value)
+                    )
+                ).all()
+            )
+        chunks = [
+            {
+                "id": row.id,
+                "evidence_id": evidence_id,
+                "source_domain": source_domain,
+                "source_type": source_type,
+                "ordinal": row.ordinal,
+                "char_start": row.char_start,
+                "char_end": row.char_end,
+                "content": row.content,
+                "content_hash": row.content_hash,
+                "token_estimate": row.token_estimate,
+                "embedding": row.embedding,
+                "snapshot_sha256": snapshot_sha256,
+            }
+            for row, evidence_id, source_domain, source_type, snapshot_sha256 in rows
+        ]
+        return rank_chunks(query, chunks, limit=limit)
 
     async def supplement_claim_evidence(
         self,
@@ -393,18 +807,32 @@ class InvestigationRepository:
             if len(evidence_rows) != len(set(evidence_ids)):
                 raise InvestigationConflict("Claim supplement references missing or inactive evidence")
             existing_ids = set((await session.execute(select(ClaimEvidenceRow.evidence_id).where(ClaimEvidenceRow.claim_id == claim_id))).scalars())
-            session.add_all(
-                [
+            for row in evidence_rows:
+                if row.id in existing_ids:
+                    continue
+                if row.snapshot_id is None:
+                    raise InvestigationConflict("Claim supplement references Evidence without an immutable snapshot")
+                snapshot = await session.get(EvidenceSnapshotRow, row.snapshot_id)
+                if snapshot is None:
+                    raise InvestigationConflict("Evidence snapshot is missing")
+                try:
+                    quote = locate_verbatim_quote(snapshot.content_text, row.excerpt)
+                except EvidenceValidationError as exc:
+                    raise InvestigationConflict(str(exc)) from exc
+                session.add(
                     ClaimEvidenceRow(
                         claim_id=claim.id,
                         evidence_id=row.id,
                         relation=ClaimEvidenceRelation.SUPPORTS.value,
                         support_score=row.credibility_score,
+                        quoted_span=quote.quote,
+                        quote_start=quote.start,
+                        quote_end=quote.end,
+                        snapshot_sha256=quote.snapshot_sha256,
+                        validation_status="verified",
+                        entailment_status="pending_audit",
                     )
-                    for row in evidence_rows
-                    if row.id not in existing_ids
-                ]
-            )
+                )
             await session.flush()
             all_evidence = list(
                 (
@@ -415,9 +843,9 @@ class InvestigationRepository:
             )
             count = independent_source_count(row.source_domain for row in all_evidence)
             claim.independent_source_count = count
-            claim.status = (ClaimStatus.SUPPORTED if count >= (2 if claim.material else 1) else ClaimStatus.UNCERTAIN).value
-            merged_ids = sorted({row.id for row in all_evidence})
-        return self._claim_dict(claim, merged_ids)
+            claim.status = ClaimStatus.UNCERTAIN.value
+            links = list((await session.execute(select(ClaimEvidenceRow).where(ClaimEvidenceRow.claim_id == claim_id))).scalars())
+        return self._claim_dict(claim, [self._claim_link_dict(link) for link in links])
 
     async def replace_audit_issues(
         self,
@@ -576,6 +1004,51 @@ class InvestigationRepository:
             session.add(InvestigationEventRow(investigation_id=investigation_id, event_type="ci.report.ready_for_review", stage="awaiting_publish_approval", payload={"report_id": report.id, "version": report.version}))
         return await self.latest_report(investigation_id, user_id=user_id)
 
+    async def record_export(
+        self,
+        investigation_id: str,
+        *,
+        report_id: str,
+        export_format: str,
+        object_ref: str,
+        content_hash: str,
+        user_id: str,
+    ) -> dict[str, Any] | None:
+        async with self._sf() as session, session.begin():
+            investigation = await session.get(InvestigationRow, investigation_id)
+            if investigation is None or investigation.user_id != user_id:
+                return None
+            report = await session.get(ReportRow, report_id)
+            if report is None or report.investigation_id != investigation_id:
+                raise InvestigationConflict("Export report does not belong to Investigation")
+            existing = (
+                await session.execute(
+                    select(ExportRow).where(
+                        ExportRow.report_id == report_id,
+                        ExportRow.format == export_format,
+                        ExportRow.content_hash == content_hash,
+                    )
+                )
+            ).scalar_one_or_none()
+            if existing is None:
+                existing = ExportRow(
+                    id=self._id(),
+                    investigation_id=investigation_id,
+                    report_id=report_id,
+                    format=export_format,
+                    status="ready",
+                    object_ref=object_ref,
+                    content_hash=content_hash,
+                )
+                session.add(existing)
+            return {
+                "id": existing.id,
+                "format": existing.format,
+                "status": existing.status,
+                "object_ref": existing.object_ref,
+                "content_hash": existing.content_hash,
+            }
+
     async def approve_report(self, investigation_id: str, report_version: int, *, user_id: str, idempotency_key: str) -> dict[str, Any] | None:
         async with self._sf() as session, session.begin():
             investigation = await session.get(InvestigationRow, investigation_id, with_for_update=True)
@@ -651,12 +1124,14 @@ class InvestigationRepository:
                 "time_range": scope.time_range,
                 "competitors": [item.canonical_name for item in competitors],
                 "dimensions": scope.dimensions,
+                "official_domains": {item.canonical_name: item.official_domains for item in competitors if item.official_domains},
                 "version": scope.version,
                 "approved_at": scope.approved_at,
             },
             "rework_round": row.rework_round,
             "token_used": row.token_used,
             "token_budget": row.token_budget,
+            "deadline_at": row.deadline_at,
             "created_at": row.created_at,
             "updated_at": row.updated_at,
         }
@@ -665,6 +1140,7 @@ class InvestigationRepository:
     def _evidence_dict(row: EvidenceRow) -> dict[str, Any]:
         return {
             "id": row.id,
+            "snapshot_id": row.snapshot_id,
             "investigation_id": row.investigation_id,
             "competitor_id": row.competitor_id,
             "source_url": row.source_url,
@@ -686,7 +1162,7 @@ class InvestigationRepository:
         }
 
     @staticmethod
-    def _claim_dict(row: ClaimRow, evidence_ids: list[str]) -> dict[str, Any]:
+    def _claim_dict(row: ClaimRow, evidence_bindings: list[dict[str, Any]]) -> dict[str, Any]:
         return {
             "id": row.id,
             "investigation_id": row.investigation_id,
@@ -695,9 +1171,46 @@ class InvestigationRepository:
             "text": row.text,
             "material": row.material,
             "claim_type": row.claim_type,
-            "evidence_ids": evidence_ids,
+            "evidence_ids": [binding["evidence_id"] for binding in evidence_bindings],
+            "evidence_bindings": evidence_bindings,
             "status": row.status,
             "independent_source_count": row.independent_source_count,
+        }
+
+    @staticmethod
+    def _claim_link_dict(row: ClaimEvidenceRow) -> dict[str, Any]:
+        return {
+            "evidence_id": row.evidence_id,
+            "relation": row.relation,
+            "verbatim_quote": row.quoted_span,
+            "quote_start": row.quote_start,
+            "quote_end": row.quote_end,
+            "snapshot_sha256": row.snapshot_sha256,
+            "validation_status": row.validation_status,
+            "entailment_status": row.entailment_status,
+        }
+
+    @staticmethod
+    def _price_observation_dict(row: PriceObservationRow) -> dict[str, Any]:
+        return {
+            "id": row.id,
+            "investigation_id": row.investigation_id,
+            "claim_id": row.claim_id,
+            "evidence_id": row.evidence_id,
+            "plan_name": row.plan_name,
+            "amount": row.amount,
+            "currency": row.currency,
+            "billing_period": row.billing_period,
+            "billing_unit": row.billing_unit,
+            "seat_minimum": row.seat_minimum,
+            "region": row.region,
+            "tax_included": row.tax_included,
+            "promotion": row.promotion,
+            "effective_at": row.effective_at,
+            "official": row.official,
+            "verbatim_quote": row.verbatim_quote,
+            "snapshot_sha256": row.snapshot_sha256,
+            "created_at": row.created_at,
         }
 
     @staticmethod

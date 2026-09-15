@@ -56,6 +56,10 @@ connection as the task, and must preserve explicit `uncertain` Claim labels.
 The detail workspace also renders per-Run/Batch stage items and persisted audit
 issues. Keep protocol/task identifiers diagnostic-only; user actions must use
 owner-scoped API resource IDs.
+Claim views must display verbatim quote validation and entailment status rather
+than only citation counts. Pricing uses the structured pricing endpoint, user
+materials enter through the Investigation upload endpoint, and PDF downloads
+use the server export route rather than browser print.
 
 ```
 Frontend (Next.js) ──▶ LangGraph SDK ──▶ LangGraph Backend (lead_agent)

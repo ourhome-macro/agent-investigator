@@ -21,6 +21,7 @@ export interface ResearchScope {
   time_range: string;
   competitors: string[];
   dimensions: string[];
+  official_domains?: Record<string, string[]>;
   version?: number;
   approved_at?: string | null;
 }
@@ -36,12 +37,14 @@ export interface Investigation {
   rework_round: number;
   token_used: number;
   token_budget: number;
+  deadline_at: string | null;
   created_at: string;
   updated_at: string;
 }
 
 export interface Evidence {
   id: string;
+  snapshot_id: string | null;
   title: string;
   source_url: string;
   source_domain: string;
@@ -56,8 +59,32 @@ export interface Claim {
   text: string;
   material: boolean;
   evidence_ids: string[];
+  evidence_bindings: Array<{
+    evidence_id: string;
+    relation: "supports" | "contradicts" | "context";
+    verbatim_quote: string;
+    quote_start: number;
+    quote_end: number;
+    snapshot_sha256: string;
+    validation_status: string;
+    entailment_status: string | null;
+  }>;
   status: "supported" | "contradicted" | "uncertain";
   independent_source_count: number;
+}
+
+export interface PriceObservation {
+  id: string;
+  claim_id: string;
+  evidence_id: string;
+  plan_name: string;
+  amount: string;
+  currency: string;
+  billing_period: string;
+  billing_unit: string;
+  region: string | null;
+  official: boolean;
+  verbatim_quote: string;
 }
 
 export interface AuditIssue {

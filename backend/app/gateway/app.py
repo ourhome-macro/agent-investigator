@@ -436,14 +436,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         investigation_repo = getattr(app.state, "investigation_repo", None)
         if investigation_repo is not None:
             from app.investigations.batch_adapter import DurableStageBatchAdapter
+            from app.investigations.domain_runtime import set_domain_submission_handler
             from app.investigations.orchestrator import DurableCompetitiveOrchestrator
+            from app.investigations.providers import ResearchProviderRegistry
             from app.investigations.run_adapter import DeerFlowRunStageAdapter
             from app.investigations.service import InvestigationWorkflowService
 
             orchestration_repo = getattr(app.state, "investigation_orchestration_repo", None)
+            set_domain_submission_handler(orchestration_repo)
             durable_orchestrator = None
             if orchestration_repo is not None and getattr(app.state, "subagent_batches_available", False) and getattr(app.state, "subagent_batch_service", None) is not None and batch_repo is not None:
                 owner_id = f"competitive-research:{id(app)}"
+                research_providers = ResearchProviderRegistry()
                 batch_adapter = DurableStageBatchAdapter(
                     service=app.state.subagent_batch_service,
                     batch_repository=batch_repo,
@@ -455,12 +459,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                     orchestration=orchestration_repo,
                     batches=batch_adapter,
                     runs=run_adapter,
+                    providers=research_providers,
                     owner_id=owner_id,
                 )
             app.state.investigation_workflow_service = InvestigationWorkflowService(
                 investigation_repo,
                 orchestration_repository=orchestration_repo,
                 durable_orchestrator=durable_orchestrator,
+                providers=research_providers if durable_orchestrator is not None else None,
                 owner_id=owner_id if durable_orchestrator is not None else None,
             )
             await app.state.investigation_workflow_service.start()
@@ -472,6 +478,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 await app.state.investigation_workflow_service.stop()
             except Exception:
                 logger.exception("Failed to stop Competitive Research workflow service")
+        try:
+            from app.investigations.domain_runtime import set_domain_submission_handler
+
+            set_domain_submission_handler(None)
+        except Exception:
+            logger.exception("Failed to clear Competitive Research domain submission runtime")
 
         try:
             await auth.close_oidc_service()

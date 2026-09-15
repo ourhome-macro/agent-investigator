@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import uuid
 from datetime import UTC, datetime
 from typing import Any
@@ -8,8 +9,8 @@ from typing import Any
 from app.investigations.batch_adapter import DurableStageBatchAdapter
 from app.investigations.contracts import ClaimCreate, EvidenceCreate, InvestigationStatus, ResearchScope
 from app.investigations.orchestration_repository import OrchestrationRepository
-from app.investigations.protocols import DomainSubmission, StageName, StageTask, SubmissionKind
-from app.investigations.providers import canonicalize_url
+from app.investigations.protocols import DomainSubmission, ReceiptStatus, StageName, StageTask, SubmissionKind
+from app.investigations.providers import ResearchProviderRegistry, canonicalize_url
 from app.investigations.repository import InvestigationConflict, InvestigationRepository
 from app.investigations.run_adapter import DeerFlowRunStageAdapter
 
@@ -32,12 +33,14 @@ class DurableCompetitiveOrchestrator:
         orchestration: OrchestrationRepository,
         batches: DurableStageBatchAdapter,
         runs: DeerFlowRunStageAdapter,
+        providers: ResearchProviderRegistry,
         owner_id: str,
     ) -> None:
         self._investigations = investigations
         self._orchestration = orchestration
         self._batches = batches
         self._runs = runs
+        self._providers = providers
         self._owner_id = owner_id
 
     async def execute(self, workflow: dict[str, Any], *, user_id: str) -> None:
@@ -129,6 +132,7 @@ class DurableCompetitiveOrchestrator:
                 "Keep 2-5 named competitors and explain no conclusions at planning time.",
                 "Preserve the requested market, audience, language, and time range unless clearly inconsistent.",
                 "Return payload.scope with market, audience, language, time_range, competitors, and dimensions.",
+                "Include official_domains only when a competitor's official domain is unambiguous.",
             ],
         )
         submission = await self._execute_run_task(
@@ -160,6 +164,7 @@ class DurableCompetitiveOrchestrator:
                     "time_range": investigation["scope"]["time_range"],
                     "competitor_id": competitor["id"],
                     "competitor": competitor["name"],
+                    "official_domains": competitor.get("official_domains", []),
                     "dimension": dimension,
                     "max_evidence": 5,
                 },
@@ -175,6 +180,8 @@ class DurableCompetitiveOrchestrator:
         attempt = await self._orchestration.start_stage(workflow["id"], owner_id=self._owner_id, stage=StageName.COLLECTING, tasks=tasks)
         if attempt["status"] == "completed":
             return
+        if not attempt["resumed"]:
+            await self._guard_attempt_budget(attempt["id"], investigation, tasks, user_id=user_id)
         batch = await self._batches.submit(
             stage_attempt_id=attempt["id"],
             tasks=tasks,
@@ -186,7 +193,14 @@ class DurableCompetitiveOrchestrator:
                 "published_at when known, and language. Include only evidence you actually retrieved."
             ),
         )
-        submissions, receipts = await self._batches.wait(batch_id=batch["id"], stage_attempt_id=attempt["id"], tasks=tasks, user_id=user_id)
+        submissions, receipts = await self._batches.wait(
+            batch_id=batch["id"],
+            stage_attempt_id=attempt["id"],
+            tasks=tasks,
+            user_id=user_id,
+            timeout_seconds=self._remaining_seconds(investigation),
+        )
+        await self._record_receipts(investigation["id"], workflow["id"], receipts, user_id=user_id)
         accepted = await self._apply_evidence(investigation["id"], submissions, tasks, user_id=user_id)
         successful_items = sum(receipt.status.value == "succeeded" for receipt in receipts)
         required_items = max(1, (len(tasks) * 3 + 4) // 5)
@@ -200,41 +214,40 @@ class DurableCompetitiveOrchestrator:
             raise StageAcceptanceError("Collection did not reach the 60% item and minimum evidence thresholds")
 
     async def _analyze(self, workflow: dict[str, Any], investigation: dict[str, Any], *, user_id: str) -> None:
-        evidence = await self._investigations.list_evidence(investigation["id"], user_id=user_id) or []
-        compact = [
-            {
-                "id": item["id"],
-                "domain": item["source_domain"],
-                "title": item["title"],
-                "excerpt": item["excerpt"][:1600],
-                "credibility_score": item["credibility_score"],
-            }
-            for item in evidence[:100]
-        ]
-        tasks = [
-            self._task(
-                workflow,
-                investigation,
-                stage=StageName.ANALYZING,
-                item_key=f"dimension:{dimension}",
-                role=self._analysis_role(dimension),
-                input_data={
-                    "brief": investigation["brief"],
-                    "competitors": investigation["scope"]["competitors"],
-                    "dimension": dimension,
-                    "evidence": compact,
-                },
-                acceptance=[
-                    "Every factual claim references only provided evidence IDs.",
-                    "Material claims should cite two independent domains when evidence permits.",
-                    "Missing support must remain an explicit uncertainty.",
-                ],
+        tasks: list[StageTask] = []
+        for dimension in investigation["scope"]["dimensions"]:
+            context = await self._investigations.retrieve_context(
+                investigation["id"],
+                user_id=user_id,
+                query=f"{investigation['brief']} {' '.join(investigation['scope']['competitors'])} {dimension}",
+                limit=16,
             )
-            for dimension in investigation["scope"]["dimensions"]
-        ]
+            tasks.append(
+                self._task(
+                    workflow,
+                    investigation,
+                    stage=StageName.ANALYZING,
+                    item_key=f"dimension:{dimension}",
+                    role=self._analysis_role(dimension),
+                    input_data={
+                        "brief": investigation["brief"],
+                        "competitors": investigation["scope"]["competitors"],
+                        "dimension": dimension,
+                        "evidence_chunks": context or [],
+                    },
+                    acceptance=[
+                        "Every factual Claim has evidence_bindings with a verbatim_quote from a provided chunk.",
+                        "Every binding copies the Evidence snapshot_sha256 exactly.",
+                        "Material Claims should cite two independent domains when Evidence permits.",
+                        "Pricing Claims include structured price_observations; missing support remains uncertain.",
+                    ],
+                )
+            )
         attempt = await self._orchestration.start_stage(workflow["id"], owner_id=self._owner_id, stage=StageName.ANALYZING, tasks=tasks)
         if attempt["status"] == "completed":
             return
+        if not attempt["resumed"]:
+            await self._guard_attempt_budget(attempt["id"], investigation, tasks, user_id=user_id)
         batch = await self._batches.submit(
             stage_attempt_id=attempt["id"],
             tasks=tasks,
@@ -242,11 +255,19 @@ class DurableCompetitiveOrchestrator:
             model_name="deepseek-v4-flash",
             instruction=(
                 "Act as the named competitive analyst. Return kind='claims' with payload.claims. Each claim contains "
-                "dimension, text, material, claim_type='fact', and evidence_ids. Do not repeat evidence text as a "
-                "claim and do not use evidence IDs outside the task envelope."
+                "dimension, text, material, claim_type, evidence_bindings, and price_observations. Every binding must "
+                "include evidence_id, relation, an exact verbatim_quote from evidence_chunks, and snapshot_sha256. "
+                "Pricing claims use claim_type='pricing' and structured observations. Never invent or normalize numbers."
             ),
         )
-        submissions, receipts = await self._batches.wait(batch_id=batch["id"], stage_attempt_id=attempt["id"], tasks=tasks, user_id=user_id)
+        submissions, receipts = await self._batches.wait(
+            batch_id=batch["id"],
+            stage_attempt_id=attempt["id"],
+            tasks=tasks,
+            user_id=user_id,
+            timeout_seconds=self._remaining_seconds(investigation),
+        )
+        await self._record_receipts(investigation["id"], workflow["id"], receipts, user_id=user_id)
         accepted = await self._apply_claims(investigation["id"], submissions, user_id=user_id)
         successful_items = sum(receipt.status.value == "succeeded" for receipt in receipts)
         required_items = max(1, (len(tasks) * 3 + 4) // 5)
@@ -262,7 +283,9 @@ class DurableCompetitiveOrchestrator:
     async def _audit(self, workflow: dict[str, Any], investigation: dict[str, Any], *, user_id: str) -> list[dict[str, Any]]:
         evidence = await self._investigations.list_evidence(investigation["id"], user_id=user_id) or []
         claims = await self._investigations.list_claims(investigation["id"], user_id=user_id) or []
+        prices = await self._investigations.list_price_observations(investigation["id"], user_id=user_id) or []
         deterministic = self._deterministic_audit_issues(claims, evidence)
+        deterministic.extend(self._pricing_audit_issues(claims, prices))
         task = self._task(
             workflow,
             investigation,
@@ -282,6 +305,7 @@ class DurableCompetitiveOrchestrator:
                     for item in evidence[:200]
                 ],
                 "deterministic_issues": deterministic,
+                "price_observations": prices,
             },
             acceptance=[
                 "Never waive a deterministic issue unless the cited evidence directly disproves it.",
@@ -296,11 +320,22 @@ class DurableCompetitiveOrchestrator:
             instruction=(
                 "Act as an independent Evidence Auditor. Return kind='audit'. Treat deterministic_issues as mandatory. "
                 "Add semantic-support, contradiction, exact-number, pricing-source, and source-independence issues that "
-                "you can justify from the supplied records. Return payload.issues as a JSON list."
+                "you can justify from the supplied records. Return payload.binding_verdicts for every Claim-Evidence "
+                "binding with claim_id, evidence_id, relation, verdict (entails, partially_supports, contradicts, or "
+                "unrelated), and reason. Return payload.issues as a JSON list."
             ),
         )
         if submission is None:
             return await self._investigations.list_audit_issues(investigation["id"], user_id=user_id, status="open") or []
+        await self._investigations.apply_audit_verdicts(
+            investigation["id"],
+            [item for item in submission.payload.get("binding_verdicts", []) if isinstance(item, dict)],
+            user_id=user_id,
+            auditor="evidence-auditor",
+        )
+        claims = await self._investigations.list_claims(investigation["id"], user_id=user_id) or []
+        deterministic = self._deterministic_audit_issues(claims, evidence)
+        deterministic.extend(self._pricing_audit_issues(claims, prices))
         issues = list(deterministic)
         known_claim_ids = {claim["id"] for claim in claims}
         for candidate in submission.payload.get("issues", [])[:200]:
@@ -370,6 +405,8 @@ class DurableCompetitiveOrchestrator:
         attempt = await self._orchestration.start_stage(workflow["id"], owner_id=self._owner_id, stage=StageName.REWORKING, tasks=tasks)
         if attempt["status"] == "completed":
             return
+        if not attempt["resumed"]:
+            await self._guard_attempt_budget(attempt["id"], investigation, tasks, user_id=user_id)
         batch = await self._batches.submit(
             stage_attempt_id=attempt["id"],
             tasks=tasks,
@@ -377,7 +414,14 @@ class DurableCompetitiveOrchestrator:
             model_name="deepseek-v4-flash",
             instruction=("Act as a targeted evidence collector. Use web_search and web_fetch. Return kind='evidence' with payload.evidence containing only sources that address the stated audit issue."),
         )
-        submissions, receipts = await self._batches.wait(batch_id=batch["id"], stage_attempt_id=attempt["id"], tasks=tasks, user_id=user_id)
+        submissions, receipts = await self._batches.wait(
+            batch_id=batch["id"],
+            stage_attempt_id=attempt["id"],
+            tasks=tasks,
+            user_id=user_id,
+            timeout_seconds=self._remaining_seconds(investigation),
+        )
+        await self._record_receipts(investigation["id"], workflow["id"], receipts, user_id=user_id)
         accepted = await self._apply_evidence(investigation["id"], submissions, tasks, user_id=user_id)
         succeeded = sum(receipt.status.value == "succeeded" for receipt in receipts)
         stage_ok = succeeded > 0
@@ -393,6 +437,7 @@ class DurableCompetitiveOrchestrator:
         claims = await self._investigations.list_claims(investigation["id"], user_id=user_id) or []
         evidence = await self._investigations.list_evidence(investigation["id"], user_id=user_id) or []
         issues = await self._investigations.list_audit_issues(investigation["id"], user_id=user_id, status="open") or []
+        prices = await self._investigations.list_price_observations(investigation["id"], user_id=user_id) or []
         task = self._task(
             workflow,
             investigation,
@@ -405,6 +450,7 @@ class DurableCompetitiveOrchestrator:
                 "claims": claims[:250],
                 "evidence": [{"id": item["id"], "title": item["title"], "url": item["source_url"], "excerpt": item["excerpt"][:800]} for item in evidence[:250]],
                 "open_audit_issues": issues,
+                "price_observations": prices,
                 "required_section_types": list(self._required_report_sections()),
             },
             acceptance=[
@@ -440,14 +486,35 @@ class DurableCompetitiveOrchestrator:
                     raise StageAcceptanceError(f"Completed {task.stage.value} stage has no durable submission")
                 submission.require_matches(task)
                 return submission
+            if not attempt["resumed"]:
+                investigation = await self._require_investigation(task.investigation_id, user_id)
+                await self._guard_attempt_budget(attempt["id"], investigation, [task], user_id=user_id)
+            submission_tool = {
+                StageName.PLANNING: "submit_scope",
+                StageName.AUDITING: "submit_audit",
+                StageName.SYNTHESIZING: "submit_report_section",
+            }.get(task.stage)
             submission, receipt = await self._runs.execute(
                 task,
                 user_id=user_id,
-                instruction=instruction,
+                instruction=(instruction + (f" You MUST call {submission_tool} with task_id='{task.task_id}', then return that tool's JSON result exactly." if submission_tool else "")),
                 existing_run_id=attempt.get("run_id"),
                 on_run_started=lambda run_id: self._orchestration.bind_run(attempt["id"], run_id=run_id),
+                timeout_seconds=self._remaining_seconds(investigation),
             )
+            persisted = await self._orchestration.get_stage_submission(attempt["id"], item_key=task.item_key)
+            if persisted is not None:
+                persisted.require_matches(task)
+                submission = persisted
+                receipt.status = ReceiptStatus.SUCCEEDED
+                receipt.submission_kind = persisted.kind
+                receipt.error = None
+            else:
+                submission = None
+                receipt.status = ReceiptStatus.REJECTED
+                receipt.error = f"{task.stage.value} Agent did not use its required domain submission tool"
             receipt.attempt = attempt["attempt"]
+            await self._record_receipts(task.investigation_id, workflow["id"], [receipt], user_id=user_id)
             await self._orchestration.update_stage_item(
                 attempt["id"],
                 item_key=task.item_key,
@@ -464,14 +531,83 @@ class DurableCompetitiveOrchestrator:
             if attempt["attempt"] >= 3:
                 raise StageAcceptanceError(receipt.error or f"{task.stage.value} run did not return an accepted submission")
 
+    async def _assert_budget(self, investigation: dict[str, Any], tasks: list[StageTask], *, user_id: str) -> None:
+        estimated = sum(max(3000, len(json.dumps(task.input, ensure_ascii=False, default=str)) // 2 + 4000) for task in tasks)
+        await self._investigations.assert_execution_budget(
+            investigation["id"],
+            user_id=user_id,
+            stage=tasks[0].stage.value,
+            estimated_tokens=estimated,
+        )
+
+    async def _guard_attempt_budget(
+        self,
+        stage_attempt_id: str,
+        investigation: dict[str, Any],
+        tasks: list[StageTask],
+        *,
+        user_id: str,
+    ) -> None:
+        try:
+            await self._assert_budget(investigation, tasks, user_id=user_id)
+        except Exception as exc:
+            await self._orchestration.finish_stage(stage_attempt_id, succeeded=False, error=str(exc)[:1000])
+            raise
+
+    async def _record_receipts(
+        self,
+        investigation_id: str,
+        workflow_run_id: str,
+        receipts: list[Any],
+        *,
+        user_id: str,
+    ) -> None:
+        for receipt in receipts:
+            execution_id = receipt.run_id or receipt.durable_batch_item_id or receipt.task_id
+            await self._investigations.record_token_usage(
+                investigation_id,
+                user_id=user_id,
+                workflow_run_id=workflow_run_id,
+                stage=receipt.stage.value,
+                task_id=receipt.task_id,
+                run_id=receipt.run_id,
+                durable_batch_id=receipt.durable_batch_id,
+                model_name=receipt.model_name,
+                token_usage=receipt.token_usage,
+                idempotency_key=f"{workflow_run_id}:{receipt.stage.value}:{execution_id}:{receipt.attempt}",
+            )
+
+    @staticmethod
+    def _remaining_seconds(investigation: dict[str, Any]) -> float:
+        deadline = investigation.get("deadline_at")
+        if deadline is None:
+            return 1800.0
+        if isinstance(deadline, str):
+            deadline = datetime.fromisoformat(deadline.replace("Z", "+00:00"))
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=UTC)
+        return max(1.0, min(1800.0, (deadline - datetime.now(UTC)).total_seconds()))
+
     @staticmethod
     def _deterministic_audit_issues(claims: list[dict[str, Any]], evidence: list[dict[str, Any]]) -> list[dict[str, Any]]:
         evidence_by_id = {item["id"]: item for item in evidence}
         issues: list[dict[str, Any]] = []
         for claim in claims:
-            cited = [evidence_by_id[value] for value in claim["evidence_ids"] if value in evidence_by_id]
+            verified_bindings = [binding for binding in claim.get("evidence_bindings", []) if binding.get("relation") == "supports" and binding.get("validation_status") == "verified" and binding.get("entailment_status") == "entails"]
+            cited = [evidence_by_id[binding["evidence_id"]] for binding in verified_bindings if binding["evidence_id"] in evidence_by_id]
             domains = {item["source_domain"].lower() for item in cited}
             required = 2 if claim["material"] else 1
+            unverified = [binding for binding in claim.get("evidence_bindings", []) if binding.get("validation_status") != "verified" or binding.get("entailment_status") != "entails"]
+            if unverified:
+                issues.append(
+                    {
+                        "claim_id": claim["id"],
+                        "severity": "error",
+                        "rule": "semantic_entailment",
+                        "reason": f"{len(unverified)} Claim-Evidence bindings are not verified as entails.",
+                        "required_action": "Collect an exact supporting quote or downgrade the Claim to uncertain.",
+                    }
+                )
             if not cited:
                 issues.append(
                     {
@@ -509,6 +645,23 @@ class DurableCompetitiveOrchestrator:
             "risks_unknowns",
             "evidence_appendix",
         )
+
+    @staticmethod
+    def _pricing_audit_issues(claims: list[dict[str, Any]], prices: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        issues: list[dict[str, Any]] = []
+        for claim in claims:
+            explicitly_estimated = any(marker in claim["text"].casefold() for marker in ("estimate", "estimated", "第三方估计", "估算"))
+            if claim["claim_type"] == "pricing" and not explicitly_estimated and not any(price["claim_id"] == claim["id"] and price["official"] for price in prices):
+                issues.append(
+                    {
+                        "claim_id": claim["id"],
+                        "severity": "warning",
+                        "rule": "pricing_official_source",
+                        "reason": "Pricing Claim has no official-domain PriceObservation.",
+                        "required_action": "Collect the official pricing page or label the value as a third-party estimate.",
+                    }
+                )
+        return issues
 
     def _validate_report_submission(
         self,
@@ -575,8 +728,22 @@ class DurableCompetitiveOrchestrator:
                     excerpt = str(candidate.get("excerpt") or "").strip()
                     if len(excerpt) < 40:
                         continue
-                    source_type = str(candidate.get("source_type") or "web")[:32]
-                    authority = {"official": 30, "financial_report": 28, "documentation": 27, "news": 20}.get(source_type, 15)
+                    document = await self._providers.fetch_url(
+                        canonical,
+                        fallback_content=excerpt,
+                        investigation_id=investigation_id,
+                    )
+                    source_type = document.source_type
+                    authority = {
+                        "official": 30,
+                        "pricing": 30,
+                        "financial_report": 28,
+                        "documentation": 27,
+                        "github": 24,
+                        "news": 20,
+                    }.get(source_type.value, 15)
+                    if document.extraction_method == "search_snippet":
+                        authority = min(authority, 15)
                     result = await self._investigations.add_evidence(
                         investigation_id,
                         EvidenceCreate(
@@ -590,11 +757,14 @@ class DurableCompetitiveOrchestrator:
                             published_at=candidate.get("published_at"),
                             retrieved_at=datetime.now(UTC),
                             excerpt=excerpt[:20_000],
-                            content_hash=hashlib.sha256(excerpt.encode("utf-8")).hexdigest(),
+                            snapshot_text=document.content,
+                            snapshot_mime_type=document.mime_type,
+                            extraction_method=document.extraction_method,
+                            content_hash=hashlib.sha256(document.content.encode("utf-8")).hexdigest(),
                             language=str(candidate.get("language") or "zh-CN")[:16],
                             source_authority=authority,
                             freshness=15 if candidate.get("published_at") else 8,
-                            extraction_quality=8 if len(excerpt) >= 500 else 5,
+                            extraction_quality=(2 if document.extraction_method == "search_snippet" else 8 if len(document.content) >= 500 else 5),
                             specificity=7,
                             corroboration=0,
                         ),
@@ -631,7 +801,8 @@ class DurableCompetitiveOrchestrator:
                             text=str(candidate["text"]),
                             material=bool(candidate.get("material", True)),
                             claim_type=str(candidate.get("claim_type") or "fact"),
-                            evidence_ids=[str(value) for value in candidate.get("evidence_ids", [])],
+                            evidence_bindings=candidate.get("evidence_bindings", []),
+                            price_observations=candidate.get("price_observations", []),
                         ),
                         user_id=user_id,
                         agent_name=submission.item_key,

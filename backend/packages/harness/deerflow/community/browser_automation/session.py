@@ -389,7 +389,11 @@ class BrowserSession:
                 return self._page
 
             if self._browser is None or not self._browser.is_connected():
-                self._browser = await self._playwright.chromium.launch(headless=self._headless)
+                executable_path = os.getenv("CI_CHROMIUM_PATH")
+                launch_options: dict[str, Any] = {"headless": self._headless}
+                if executable_path and os.path.isfile(executable_path):
+                    launch_options["executable_path"] = executable_path
+                self._browser = await self._playwright.chromium.launch(**launch_options)
             # device_scale_factor=2 renders screenshots at retina density so the
             # panel stays crisp when the image is scaled up to fill the view.
             self._context = await self._browser.new_context(viewport=self._viewport, device_scale_factor=2)

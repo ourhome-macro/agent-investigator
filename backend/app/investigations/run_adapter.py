@@ -56,6 +56,7 @@ class DeerFlowRunStageAdapter:
         instruction: str,
         existing_run_id: str | None = None,
         on_run_started: Callable[[str], Awaitable[None]] | None = None,
+        timeout_seconds: float | None = None,
     ) -> tuple[DomainSubmission | None, AgentReceipt]:
         started_at = datetime.now(UTC)
         if existing_run_id is None:
@@ -78,7 +79,7 @@ class DeerFlowRunStageAdapter:
         else:
             run_id = existing_run_id
         try:
-            record = await self._wait_for_run(run_id, user_id=user_id)
+            record = await self._wait_for_run(run_id, user_id=user_id, timeout_seconds=timeout_seconds)
             status = self._status_value(record)
             if status != "success":
                 return None, self._receipt(
@@ -120,6 +121,10 @@ class DeerFlowRunStageAdapter:
                 submission=submission,
             )
         except TimeoutError as exc:
+            try:
+                await self._app.state.run_manager.cancel(run_id, action="interrupt")
+            except Exception:
+                pass
             return None, self._receipt(
                 task,
                 started_at=started_at,
@@ -129,9 +134,10 @@ class DeerFlowRunStageAdapter:
                 error=str(exc),
             )
 
-    async def _wait_for_run(self, run_id: str, *, user_id: str) -> Any:
+    async def _wait_for_run(self, run_id: str, *, user_id: str, timeout_seconds: float | None = None) -> Any:
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + self._timeout_seconds
+        effective_timeout = self._timeout_seconds if timeout_seconds is None else min(self._timeout_seconds, timeout_seconds)
+        deadline = loop.time() + effective_timeout
         while loop.time() < deadline:
             record = await self._get_run(run_id, user_id=user_id)
             if record is None:
@@ -139,7 +145,7 @@ class DeerFlowRunStageAdapter:
             if self._status_value(record) in self.TERMINAL:
                 return record
             await asyncio.sleep(self._poll_interval_seconds)
-        raise TimeoutError(f"DeerFlow run exceeded {self._timeout_seconds:g} seconds")
+        raise TimeoutError(f"DeerFlow run exceeded {effective_timeout:g} seconds")
 
     @staticmethod
     def _status_value(record: Any) -> str:

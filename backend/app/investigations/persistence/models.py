@@ -119,6 +119,7 @@ class StageItemRow(InvestigationBase):
 class EvidenceRow(InvestigationBase):
     __tablename__ = "ci_evidence"
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    snapshot_id: Mapped[str | None] = mapped_column(ForeignKey("ci_evidence_snapshots.id", ondelete="RESTRICT"), nullable=True, index=True)
     investigation_id: Mapped[str] = mapped_column(ForeignKey("ci_investigations.id", ondelete="CASCADE"), index=True)
     competitor_id: Mapped[str | None] = mapped_column(ForeignKey("ci_competitors.id", ondelete="SET NULL"), nullable=True, index=True)
     source_url: Mapped[str] = mapped_column(Text)
@@ -167,7 +168,65 @@ class ClaimEvidenceRow(InvestigationBase):
     relation: Mapped[str] = mapped_column(String(16), primary_key=True)
     support_score: Mapped[int] = mapped_column(Integer, default=0)
     quoted_span: Mapped[str | None] = mapped_column(Text, nullable=True)
+    quote_start: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    quote_end: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    snapshot_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    validation_status: Mapped[str] = mapped_column(String(24), default="pending")
+    entailment_status: Mapped[str | None] = mapped_column(String(24), nullable=True)
     auditor_status: Mapped[str | None] = mapped_column(String(24), nullable=True)
+
+
+class EvidenceSnapshotRow(InvestigationBase):
+    __tablename__ = "ci_evidence_snapshots"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    investigation_id: Mapped[str] = mapped_column(ForeignKey("ci_investigations.id", ondelete="CASCADE"), index=True)
+    source_url: Mapped[str] = mapped_column(Text)
+    content_text: Mapped[str] = mapped_column(Text)
+    content_hash: Mapped[str] = mapped_column(String(64), index=True)
+    mime_type: Mapped[str] = mapped_column(String(128))
+    extraction_method: Mapped[str] = mapped_column(String(64), index=True)
+    language: Mapped[str] = mapped_column(String(16))
+    object_ref: Mapped[str | None] = mapped_column(Text, nullable=True)
+    original_ref: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+    __table_args__ = (UniqueConstraint("investigation_id", "content_hash", name="uq_ci_snapshot_content"),)
+
+
+class EvidenceChunkRow(InvestigationBase):
+    __tablename__ = "ci_evidence_chunks"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    snapshot_id: Mapped[str] = mapped_column(ForeignKey("ci_evidence_snapshots.id", ondelete="CASCADE"), index=True)
+    ordinal: Mapped[int] = mapped_column(Integer)
+    char_start: Mapped[int] = mapped_column(Integer)
+    char_end: Mapped[int] = mapped_column(Integer)
+    content: Mapped[str] = mapped_column(Text)
+    content_hash: Mapped[str] = mapped_column(String(64), index=True)
+    token_estimate: Mapped[int] = mapped_column(Integer)
+    embedding: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+    __table_args__ = (UniqueConstraint("snapshot_id", "ordinal", name="uq_ci_snapshot_chunk_ordinal"),)
+
+
+class PriceObservationRow(InvestigationBase):
+    __tablename__ = "ci_price_observations"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    investigation_id: Mapped[str] = mapped_column(ForeignKey("ci_investigations.id", ondelete="CASCADE"), index=True)
+    claim_id: Mapped[str] = mapped_column(ForeignKey("ci_claims.id", ondelete="CASCADE"), index=True)
+    evidence_id: Mapped[str] = mapped_column(ForeignKey("ci_evidence.id", ondelete="CASCADE"), index=True)
+    plan_name: Mapped[str] = mapped_column(String(200))
+    amount: Mapped[str] = mapped_column(String(64))
+    currency: Mapped[str] = mapped_column(String(8), index=True)
+    billing_period: Mapped[str] = mapped_column(String(16), index=True)
+    billing_unit: Mapped[str] = mapped_column(String(128))
+    seat_minimum: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    region: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    tax_included: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    promotion: Mapped[bool] = mapped_column(Boolean, default=False)
+    effective_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    official: Mapped[bool] = mapped_column(Boolean)
+    verbatim_quote: Mapped[str] = mapped_column(Text)
+    snapshot_sha256: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
 
 
 class AuditIssueRow(InvestigationBase):
@@ -246,4 +305,21 @@ class ExportRow(InvestigationBase):
     object_ref: Mapped[str | None] = mapped_column(Text, nullable=True)
     content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+
+
+class BudgetEntryRow(InvestigationBase):
+    __tablename__ = "ci_budget_entries"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    investigation_id: Mapped[str] = mapped_column(ForeignKey("ci_investigations.id", ondelete="CASCADE"), index=True)
+    workflow_run_id: Mapped[str | None] = mapped_column(ForeignKey("ci_workflow_runs.id", ondelete="SET NULL"), nullable=True, index=True)
+    stage: Mapped[str] = mapped_column(String(48), index=True)
+    task_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    run_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    durable_batch_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    model_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    input_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    total_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    idempotency_key: Mapped[str] = mapped_column(String(200), unique=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)

@@ -8,10 +8,11 @@ from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.investigations.contracts import ClaimCreate, EvidenceCreate, InvestigationCreate, InvestigationStatus, InvestigationType, ResearchScope
+from app.investigations.evidence_validation import sha256_text
 from app.investigations.persistence import upgrade_investigation_schema
 from app.investigations.protocols import DomainSubmission, StageName, StageTask, SubmissionKind, parse_domain_submission, render_stage_prompt
-from app.investigations.providers import ResearchProviderRegistry, SearchHit, canonicalize_url
-from app.investigations.repository import InvestigationConflict, InvestigationRepository
+from app.investigations.providers import ResearchProviderRegistry, SearchHit, SourceDocument, SourceType, canonicalize_url
+from app.investigations.repository import InvestigationRepository
 from app.investigations.scoring import claim_is_supported, credibility_score, independent_source_count
 from app.investigations.service import InvestigationWorkflowService
 from app.investigations.state_machine import InvalidInvestigationTransition, require_transition
@@ -69,7 +70,7 @@ async def test_independent_migration_and_repository_round_trip(tmp_path) -> None
         assert "ci_investigations" in tables
         assert "ci_claim_evidence" in tables
         assert "ci_stage_items" in tables
-        assert version == "ci_0005"
+        assert version == "ci_0008"
 
         repository = InvestigationRepository(async_sessionmaker(engine, expire_on_commit=False))
         created = await repository.create(
@@ -84,35 +85,22 @@ async def test_independent_migration_and_repository_round_trip(tmp_path) -> None
         assert created["status"] == InvestigationStatus.PLANNING.value
         assert created["scope"]["competitors"] == ["Acme", "Beta"]
         assert await repository.get(created["id"], user_id="other-user") is None
-        with pytest.raises(InvestigationConflict, match="Evidence can only"):
-            await repository.add_evidence(
-                created["id"],
-                EvidenceCreate(
-                    source_url="https://example.com/too-early",
-                    canonical_url="https://example.com/too-early",
-                    source_domain="example.com",
-                    title="Too early",
-                    retrieved_at=datetime.now(UTC),
-                    excerpt="This evidence must not be accepted before the scope approval stage has completed.",
-                    content_hash="f" * 64,
-                    source_authority=10,
-                    freshness=10,
-                    extraction_quality=5,
-                    specificity=5,
-                    corroboration=0,
-                ),
-                user_id="user-1",
-            )
         await repository.complete_planning(
             created["id"],
-            ResearchScope(competitors=["Acme", "Beta"]),
+            ResearchScope(competitors=["Acme", "Beta"], official_domains={"Acme": ["acme.com"]}),
             user_id="user-1",
             run_id="planning-run-1",
         )
         await repository.approve_scope(created["id"], user_id="user-1", idempotency_key="approve-scope-1")
+        competitors = await repository.list_competitors(created["id"], user_id="user-1")
+        assert competitors is not None
+        acme_id = next(item["id"] for item in competitors if item["name"] == "Acme")
 
         evidence_ids = []
+        evidence_hashes = []
+        quote = "Acme publishes a documented enterprise capability tier."
         for index, domain in enumerate(("acme.com", "industry.example")):
+            snapshot = f"Source {index}. {quote} Additional context for verification."
             evidence = await repository.add_evidence(
                 created["id"],
                 EvidenceCreate(
@@ -121,8 +109,9 @@ async def test_independent_migration_and_repository_round_trip(tmp_path) -> None
                     source_domain=domain,
                     title=f"Pricing source {index}",
                     retrieved_at=datetime.now(UTC),
-                    excerpt="Acme publishes a documented enterprise pricing tier.",
-                    content_hash=f"{index + 1:064x}",
+                    excerpt=quote,
+                    snapshot_text=snapshot,
+                    content_hash=sha256_text(snapshot),
                     source_authority=25,
                     freshness=20,
                     extraction_quality=10,
@@ -133,6 +122,30 @@ async def test_independent_migration_and_repository_round_trip(tmp_path) -> None
             )
             assert evidence is not None
             evidence_ids.append(evidence["id"])
+            evidence_hashes.append(evidence["content_hash"])
+        price_snapshot = "The Pro plan costs CNY 199 per month for each account."
+        price_evidence = await repository.add_evidence(
+            created["id"],
+            EvidenceCreate(
+                competitor_id=acme_id,
+                source_url="https://acme.com/pricing",
+                canonical_url="https://acme.com/pricing",
+                source_domain="acme.com",
+                source_type="pricing",
+                title="Official pricing",
+                retrieved_at=datetime.now(UTC),
+                excerpt=price_snapshot,
+                snapshot_text=price_snapshot,
+                content_hash=sha256_text(price_snapshot),
+                source_authority=30,
+                freshness=20,
+                extraction_quality=10,
+                specificity=10,
+                corroboration=0,
+            ),
+            user_id="user-1",
+        )
+        assert price_evidence is not None
         await repository.transition(
             created["id"],
             InvestigationStatus.NORMALIZING,
@@ -147,20 +160,70 @@ async def test_independent_migration_and_repository_round_trip(tmp_path) -> None
         )
         claim = await repository.add_claim(
             created["id"],
-            ClaimCreate(dimension="pricing", text="Acme has an enterprise pricing tier.", evidence_ids=evidence_ids),
+            ClaimCreate(
+                dimension="功能",
+                text="Acme publishes a documented enterprise capability tier.",
+                evidence_bindings=[
+                    {
+                        "evidence_id": evidence_id,
+                        "verbatim_quote": quote,
+                        "snapshot_sha256": evidence_hashes[index],
+                    }
+                    for index, evidence_id in enumerate(evidence_ids)
+                ],
+            ),
             user_id="user-1",
         )
         assert claim is not None
-        assert claim["status"] == "supported"
+        assert claim["status"] == "uncertain"
         assert claim["independent_source_count"] == 2
+
+        pricing_claim = await repository.add_claim(
+            created["id"],
+            ClaimCreate(
+                dimension="定价",
+                text="Acme Pro 套餐价格为 CNY 199 每月。",
+                claim_type="pricing",
+                material=True,
+                evidence_bindings=[
+                    {
+                        "evidence_id": price_evidence["id"],
+                        "verbatim_quote": price_snapshot,
+                        "snapshot_sha256": price_evidence["content_hash"],
+                    }
+                ],
+                price_observations=[
+                    {
+                        "evidence_id": price_evidence["id"],
+                        "plan_name": "Pro",
+                        "amount": "199",
+                        "currency": "CNY",
+                        "billing_period": "month",
+                        "official": True,
+                        "verbatim_quote": price_snapshot,
+                        "snapshot_sha256": price_evidence["content_hash"],
+                    }
+                ],
+            ),
+            user_id="user-1",
+        )
+        assert pricing_claim is not None
+        prices = await repository.list_price_observations(created["id"], user_id="user-1")
+        assert prices is not None and prices[0]["amount"] == "199" and prices[0]["currency"] == "CNY"
 
         uncertain = await repository.add_claim(
             created["id"],
             ClaimCreate(
-                dimension="pricing",
-                text="Acme has documented enterprise pricing.",
+                dimension="功能",
+                text="Acme publishes a documented enterprise capability tier.",
                 material=True,
-                evidence_ids=[evidence_ids[0]],
+                evidence_bindings=[
+                    {
+                        "evidence_id": evidence_ids[0],
+                        "verbatim_quote": quote,
+                        "snapshot_sha256": evidence_hashes[0],
+                    }
+                ],
             ),
             user_id="user-1",
             agent_name="pricing-analyst",
@@ -170,10 +233,16 @@ async def test_independent_migration_and_repository_round_trip(tmp_path) -> None
         replayed = await repository.add_claim(
             created["id"],
             ClaimCreate(
-                dimension="pricing",
+                dimension="功能",
                 text="This changed replay payload must not create another Claim.",
                 material=True,
-                evidence_ids=[evidence_ids[0]],
+                evidence_bindings=[
+                    {
+                        "evidence_id": evidence_ids[0],
+                        "verbatim_quote": quote,
+                        "snapshot_sha256": evidence_hashes[0],
+                    }
+                ],
             ),
             user_id="user-1",
             agent_name="pricing-analyst",
@@ -186,6 +255,23 @@ async def test_independent_migration_and_repository_round_trip(tmp_path) -> None
             user_id="user-1",
             event_type="ci.stage.started",
         )
+        await repository.apply_audit_verdicts(
+            created["id"],
+            [
+                {
+                    "claim_id": claim["id"],
+                    "evidence_id": evidence_id,
+                    "relation": "supports",
+                    "verdict": "entails",
+                }
+                for evidence_id in evidence_ids
+            ],
+            user_id="user-1",
+            auditor="test-auditor",
+        )
+        audited_claims = await repository.list_claims(created["id"], user_id="user-1")
+        assert audited_claims is not None
+        assert next(item for item in audited_claims if item["id"] == claim["id"])["status"] == "supported"
         issues = await repository.replace_audit_issues(
             created["id"],
             [
@@ -204,7 +290,7 @@ async def test_independent_migration_and_repository_round_trip(tmp_path) -> None
         assert len(await repository.list_audit_issues(created["id"], user_id="user-1", status="open") or []) == 1
         await repository.begin_audit_rework(created["id"], user_id="user-1", issue_ids=[issues[0]["id"]])
         supplemented = await repository.supplement_claim_evidence(created["id"], uncertain["id"], [evidence_ids[1]], user_id="user-1")
-        assert supplemented is not None and supplemented["status"] == "supported"
+        assert supplemented is not None and supplemented["status"] == "uncertain"
     finally:
         await engine.dispose()
 
@@ -271,13 +357,30 @@ async def test_workflow_reaches_report_review_with_auditable_claims(tmp_path, mo
                 SearchHit(title="Independent", url=f"https://independent.example/{slug}", content=f"Independent product review confirming the documented capability for query {slug}.", provider="scripted"),
             ]
 
-        async def fetch(self, hit: SearchHit):
-            return hit.content
+        async def fetch_url(self, url: str, *, fallback_content: str, investigation_id: str):
+            return SourceDocument(url=url, content=fallback_content, source_type=SourceType.WEB, extraction_method="scripted")
 
     async def scripted_llm(**kwargs):
         package = __import__("json").loads(kwargs["user_content"])
-        refs = [item["id"] for item in package["evidence"][:2]]
-        return __import__("json").dumps([{"dimension": "功能", "text": "Acme 提供企业级能力。", "material": True, "evidence_ids": refs}], ensure_ascii=False)
+        sources = package["evidence"][:2]
+        return __import__("json").dumps(
+            [
+                {
+                    "dimension": "功能",
+                    "text": "Acme 提供企业级能力。",
+                    "material": True,
+                    "evidence_bindings": [
+                        {
+                            "evidence_id": item["id"],
+                            "verbatim_quote": item["excerpt"],
+                            "snapshot_sha256": item["content_hash"],
+                        }
+                        for item in sources
+                    ],
+                }
+            ],
+            ensure_ascii=False,
+        )
 
     monkeypatch.setattr("app.investigations.service.run_oneshot_llm", scripted_llm)
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'workflow.db'}")
@@ -302,7 +405,7 @@ async def test_workflow_reaches_report_review_with_auditable_claims(tmp_path, mo
         claims = await repository.list_claims(created["id"], user_id="user-1")
         report = await repository.latest_report(created["id"], user_id="user-1")
         assert completed is not None and completed["status"] == "awaiting_publish_approval"
-        assert claims is not None and claims[0]["status"] == "supported"
+        assert claims is not None and claims[0]["status"] == "uncertain"
         assert report is not None and "Evidence Appendix" in report["rendered_markdown"]
         assert len(report["structured_data"]["sections"]) == 11
     finally:

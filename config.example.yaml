@@ -1040,6 +1040,24 @@ tools:
     # proxy: $HTTPS_PROXY
     # trust_env: true
 
+  # Competitive Research domain submission tools. They accept writes only for
+  # an active, owner-scoped StageTask and cannot advance workflow state.
+  - name: submit_scope
+    group: competitive-research
+    use: app.investigations.domain_tools:submit_scope_tool
+  - name: submit_evidence
+    group: competitive-research
+    use: app.investigations.domain_tools:submit_evidence_tool
+  - name: submit_claims
+    group: competitive-research
+    use: app.investigations.domain_tools:submit_claims_tool
+  - name: submit_audit
+    group: competitive-research
+    use: app.investigations.domain_tools:submit_audit_tool
+  - name: submit_report_section
+    group: competitive-research
+    use: app.investigations.domain_tools:submit_report_section_tool
+
   # Web fetch tool (uses InfoQuest)
   # - name: web_fetch
   #   group: web
@@ -2220,6 +2238,9 @@ skill_evolution:
 database:
   backend: sqlite
   sqlite_dir: .deer-flow/data
+  # Deep Research production deployment must switch to:
+  # backend: postgres
+  # postgres_url: $DATABASE_URL
 
 # ============================================================================
 # Inbound webhook dedupe storage (cross-pod redelivery dedup — issue #4120)
@@ -2293,6 +2314,7 @@ run_events:
   backend: memory
   max_trace_content: 10240
   track_token_usage: true
+  # Deep Research production deployment must use backend: db.
 
 # ============================================================================
 # Agent Storage Configuration

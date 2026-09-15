@@ -412,3 +412,12 @@ must exchange `StageTask`, `DomainSubmission`, and `AgentReceipt` records throug
 `ci_stage_items`. Preserve lease fencing, stable idempotency keys, strict task
 correlation, persisted validated submissions, item-level failure isolation, and
 the initial-plus-two-retries limit when changing this subsystem.
+
+All factual Claim writes require immutable Snapshot-backed verbatim bindings;
+never weaken quote/hash/offset, exact-value, pricing observation, or semantic
+entailment gates into prompt-only guidance. Source classification is
+server-owned. Material Claims cannot use search snippets. Investigation Agents
+must submit through `app.investigations.domain_tools`, whose runtime handler is
+owner- and active-stage-scoped. Early stages reserve 20% of the token budget.
+Production mode requires Postgres, DB Run Events, Redis, S3-compatible storage,
+strict web providers, and SSRF-guarded Playwright.

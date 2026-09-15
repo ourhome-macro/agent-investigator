@@ -72,6 +72,22 @@ class DomainSubmission(BaseModel):
         }
         if self.kind not in allowed[self.stage]:
             raise ValueError(f"Submission kind {self.kind.value} is invalid for stage {self.stage.value}")
+        required_list = {
+            SubmissionKind.EVIDENCE: "evidence",
+            SubmissionKind.CLAIMS: "claims",
+            SubmissionKind.REPORT: "sections",
+        }.get(self.kind)
+        if required_list is not None:
+            values = self.payload.get(required_list)
+            if not isinstance(values, list) or not all(isinstance(item, dict) for item in values):
+                raise ValueError(f"{self.kind.value} submission requires payload.{required_list} as an object list")
+        if self.kind == SubmissionKind.SCOPE and not isinstance(self.payload.get("scope"), dict):
+            raise ValueError("scope submission requires payload.scope")
+        if self.kind == SubmissionKind.AUDIT:
+            for field in ("binding_verdicts", "issues"):
+                values = self.payload.get(field)
+                if not isinstance(values, list) or not all(isinstance(item, dict) for item in values):
+                    raise ValueError(f"audit submission requires payload.{field} as an object list")
         return self
 
     def require_matches(self, task: StageTask) -> None:

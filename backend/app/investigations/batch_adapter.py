@@ -44,16 +44,27 @@ class DurableStageBatchAdapter:
         config = get_subagent_config("general-purpose")
         if config is None:
             raise DurableBatchUnavailable("general-purpose subagent is not registered")
+        submission_tool = {
+            StageName.COLLECTING: "submit_evidence",
+            StageName.REWORKING: "submit_evidence",
+            StageName.ANALYZING: "submit_claims",
+        }.get(tasks[0].stage)
+        allowed_tools = [submission_tool] if submission_tool else []
+        if tasks[0].stage in {StageName.COLLECTING, StageName.REWORKING}:
+            allowed_tools = ["web_search", "web_fetch", *allowed_tools]
         config = replace(
             config,
             model=model_name,
-            tools=["web_search", "web_fetch"] if tasks[0].stage in {StageName.COLLECTING, StageName.REWORKING} else [],
+            tools=allowed_tools,
             disallowed_tools=["task", "batch_task"],
         )
         items: list[BatchItemInput] = [
             {
                 "key": task.item_key,
-                "prompt": render_stage_prompt(task, instruction),
+                "prompt": render_stage_prompt(
+                    task,
+                    instruction + (f" You MUST call {submission_tool} with task_id='{task.task_id}', then return that tool's JSON result exactly." if submission_tool else ""),
+                ),
                 "acceptance_criteria": task.acceptance_criteria or None,
             }
             for task in tasks
@@ -137,14 +148,26 @@ class DurableStageBatchAdapter:
             submission = None
             error = row.get("error")
             if row["status"] == "succeeded":
-                try:
-                    submission = parse_domain_submission(row.get("result") or "")
+                persisted = None
+                if hasattr(self._orchestration, "get_stage_submission"):
+                    persisted = await self._orchestration.get_stage_submission(stage_attempt_id, item_key=task.item_key)
+                if persisted is not None:
+                    submission = persisted
                     submission.require_matches(task)
                     status = ReceiptStatus.SUCCEEDED
                     submissions.append(submission)
-                except Exception as exc:
+                elif hasattr(self._orchestration, "get_stage_submission"):
                     status = ReceiptStatus.REJECTED
-                    error = f"Invalid DomainSubmission: {exc}"
+                    error = "Agent did not use its required domain submission tool"
+                else:
+                    try:
+                        submission = parse_domain_submission(row.get("result") or "")
+                        submission.require_matches(task)
+                        status = ReceiptStatus.SUCCEEDED
+                        submissions.append(submission)
+                    except Exception as exc:
+                        status = ReceiptStatus.REJECTED
+                        error = f"Invalid DomainSubmission: {exc}"
             receipt = AgentReceipt(
                 task_id=task.task_id,
                 investigation_id=task.investigation_id,

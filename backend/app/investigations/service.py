@@ -180,7 +180,8 @@ class InvestigationWorkflowService:
                         if canonical in seen:
                             continue
                         seen.add(canonical)
-                        content = (await self._providers.fetch(hit)).strip() or hit.content.strip()
+                        document = await self._providers.fetch_url(hit.url, fallback_content=hit.content, investigation_id=investigation_id)
+                        content = document.content.strip()
                         if len(content) < 40:
                             continue
                         try:
@@ -191,10 +192,13 @@ class InvestigationWorkflowService:
                                     source_url=hit.url,
                                     canonical_url=canonical,
                                     source_domain=canonical.split("/", 3)[2],
-                                    source_type="web",
+                                    source_type=document.source_type,
                                     title=hit.title,
                                     retrieved_at=datetime.now(UTC),
                                     excerpt=content[:20_000],
+                                    snapshot_text=content,
+                                    snapshot_mime_type=document.mime_type,
+                                    extraction_method=document.extraction_method,
                                     content_hash=hashlib.sha256(content.encode("utf-8")).hexdigest(),
                                     language=investigation["scope"]["language"],
                                     source_authority=20,
@@ -252,13 +256,23 @@ class InvestigationWorkflowService:
             )
 
     async def _analyze(self, investigation: dict[str, Any], evidence: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        package = [{"id": item["id"], "domain": item["source_domain"], "title": item["title"], "excerpt": item["excerpt"][:1800]} for item in evidence[:80]]
+        package = [
+            {
+                "id": item["id"],
+                "domain": item["source_domain"],
+                "title": item["title"],
+                "excerpt": item["excerpt"][:1800],
+                "content_hash": item["content_hash"],
+            }
+            for item in evidence[:80]
+        ]
         output = await run_oneshot_llm(
             system_instruction=(
                 "You are a competitive intelligence analyst. Return JSON only: an array of factual claims. "
-                "Each item has dimension, text, material, claim_type='fact', and evidence_ids. Never cite an "
-                "evidence id that was not provided. Prefer two independent domains per material claim; otherwise "
-                "keep the claim but it will be marked uncertain."
+                "Each item has dimension, text, material, claim_type, evidence_bindings, and price_observations. "
+                "Each evidence binding contains evidence_id, relation, verbatim_quote copied exactly from the "
+                "provided excerpt, and snapshot_sha256 copied from content_hash. Pricing claims require structured "
+                "observations. Never cite an Evidence ID that was not provided."
             ),
             user_content=json.dumps(jsonable_encoder({"brief": investigation["brief"], "scope": investigation["scope"], "evidence": package}), ensure_ascii=False),
             run_name="competitive-research-analysis",
@@ -275,8 +289,17 @@ class InvestigationWorkflowService:
         for item in parsed[:40]:
             if not isinstance(item, dict):
                 continue
-            refs = [value for value in item.get("evidence_ids", []) if value in allowed]
-            claims.append({"dimension": str(item.get("dimension") or "综合"), "text": str(item.get("text") or ""), "material": bool(item.get("material", True)), "claim_type": "fact", "evidence_ids": refs})
+            bindings = [binding for binding in item.get("evidence_bindings", []) if isinstance(binding, dict) and binding.get("evidence_id") in allowed]
+            claims.append(
+                {
+                    "dimension": str(item.get("dimension") or "综合"),
+                    "text": str(item.get("text") or ""),
+                    "material": bool(item.get("material", True)),
+                    "claim_type": str(item.get("claim_type") or "fact"),
+                    "evidence_bindings": bindings,
+                    "price_observations": item.get("price_observations", []),
+                }
+            )
         return [claim for claim in claims if claim["text"]]
 
     @staticmethod
