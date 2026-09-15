@@ -54,14 +54,20 @@ def chunk_snapshot(text: str, *, max_chars: int = 2400, overlap_chars: int = 240
     return chunks
 
 
-def rank_chunks(query: str, chunks: list[dict[str, Any]], *, limit: int = 12) -> list[dict[str, Any]]:
+def rank_chunks(
+    query: str,
+    chunks: list[dict[str, Any]],
+    *,
+    limit: int = 12,
+    query_embedding: list[float] | None = None,
+) -> list[dict[str, Any]]:
     """Deterministic hybrid BM25 + hashed n-gram embedding ranker."""
 
     query_terms = _terms(query)
     if not query_terms or not chunks:
         return chunks[:limit]
     documents = [_terms(str(chunk.get("content") or "")) for chunk in chunks]
-    query_embedding = hashed_embedding(query)
+    query_vector = query_embedding or hashed_embedding(query)
     average_length = sum(len(document) for document in documents) / max(1, len(documents))
     document_frequency = {term: sum(term in document for document in documents) for term in query_terms}
     scored: list[tuple[float, int, dict[str, Any]]] = []
@@ -75,9 +81,10 @@ def rank_chunks(query: str, chunks: list[dict[str, Any]], *, limit: int = 12) ->
             denominator = frequency + 1.2 * (0.25 + 0.75 * len(document) / max(1.0, average_length))
             score += inverse * frequency * 2.2 / denominator
         embedding = chunk.get("embedding")
-        if not isinstance(embedding, list) or len(embedding) != len(query_embedding):
+        if not isinstance(embedding, list) or len(embedding) != len(query_vector):
             embedding = hashed_embedding(str(chunk.get("content") or ""))
-        hybrid_score = score + 0.35 * cosine_similarity(query_embedding, embedding)
+        semantic_score = cosine_similarity(query_vector, embedding) if len(embedding) == len(query_vector) else 0.0
+        hybrid_score = score + 0.35 * semantic_score
         scored.append((hybrid_score, -index, chunk))
     scored.sort(reverse=True, key=lambda item: (item[0], item[1]))
     return [{**chunk, "retrieval_score": score} for score, _, chunk in scored[:limit] if score > 0]

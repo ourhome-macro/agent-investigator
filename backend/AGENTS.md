@@ -420,4 +420,5 @@ server-owned. Material Claims cannot use search snippets. Investigation Agents
 must submit through `app.investigations.domain_tools`, whose runtime handler is
 owner- and active-stage-scoped. Early stages reserve 20% of the token budget.
 Production mode requires Postgres, DB Run Events, Redis, S3-compatible storage,
-strict web providers, and SSRF-guarded Playwright.
+an OpenAI-compatible semantic Embedding provider, strict web providers, and
+SSRF-guarded Playwright. Hashed n-gram embeddings are development fallback only.

@@ -18,6 +18,7 @@ from app.investigations.contracts import (
     InvestigationStatus,
     ResearchScope,
 )
+from app.investigations.embeddings import EmbeddingProvider
 from app.investigations.evidence_validation import (
     EvidenceValidationError,
     locate_verbatim_quote,
@@ -65,9 +66,16 @@ def _utc(value: datetime) -> datetime:
 
 
 class InvestigationRepository:
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession], *, artifact_storage: ArtifactStorage | None = None) -> None:
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        *,
+        artifact_storage: ArtifactStorage | None = None,
+        embedding_provider: EmbeddingProvider | None = None,
+    ) -> None:
         self._sf = session_factory
         self._artifact_storage = artifact_storage
+        self._embedding_provider = embedding_provider
 
     @staticmethod
     def _id() -> str:
@@ -372,6 +380,8 @@ class InvestigationRepository:
             "corroboration": request.corroboration,
         }
         score = credibility_score(**components)
+        chunks = chunk_snapshot(request.snapshot_text)
+        embeddings = await self._embedding_provider.embed_texts([chunk.content for chunk in chunks]) if self._embedding_provider is not None else [hashed_embedding(chunk.content) for chunk in chunks]
         object_ref = request.snapshot_ref
         if self._artifact_storage is not None:
             object_ref = await self._artifact_storage.put_bytes(
@@ -430,9 +440,9 @@ class InvestigationRepository:
                                 content=chunk.content,
                                 content_hash=chunk.content_hash,
                                 token_estimate=chunk.token_estimate,
-                                embedding=hashed_embedding(chunk.content),
+                                embedding=embedding,
                             )
-                            for chunk in chunk_snapshot(request.snapshot_text)
+                            for chunk, embedding in zip(chunks, embeddings, strict=True)
                         ]
                     )
                 row = EvidenceRow(
@@ -774,7 +784,10 @@ class InvestigationRepository:
             }
             for row, evidence_id, source_domain, source_type, snapshot_sha256 in rows
         ]
-        return rank_chunks(query, chunks, limit=limit)
+        query_embedding = None
+        if self._embedding_provider is not None:
+            query_embedding = (await self._embedding_provider.embed_texts([query]))[0]
+        return rank_chunks(query, chunks, limit=limit, query_embedding=query_embedding)
 
     async def supplement_claim_evidence(
         self,

@@ -30,8 +30,8 @@ Task、Workflow 和幂等性。Agent 不能直接推进状态机或写业务表�
 - Evidence 创建时保存不可变 Snapshot，并验证 SHA-256。
 - Evidence 摘录必须是 Snapshot 的逐字 substring；只允许 Unicode 和
   空白字符归一化。
-- Snapshot 自动切分为带原始字符 Offset 的 Chunk，并保存本地哈希
-  n-gram Embedding。
+- Snapshot 自动切分为带原始字符 Offset 的 Chunk。开发环境可使用本地哈希
+  n-gram Embedding；生产环境必须配置 OpenAI-compatible 语义 Embedding。
 - Analyst 使用按维度检索的 Top-K Chunk，不重复加载所有正文。
 - 每个事实 Claim 必须提交 Evidence Binding：Evidence ID、逐字 Quote、
   Snapshot Hash、Relation 和可选 Offset。
@@ -107,7 +107,8 @@ Count。发布基线要求：
    `database.postgres_url: $DATABASE_URL`、`run_events.backend: db` 和 Redis
    StreamBridge。
 2. 在未提交的 `.env` 设置 `CI_POSTGRES_PASSWORD`、`CI_S3_ACCESS_KEY`、
-   `CI_S3_SECRET_KEY`、Bocha/Tavily/Jina 和模型凭据。
+   `CI_S3_SECRET_KEY`、`CI_EMBEDDING_BASE_URL/API_KEY/MODEL`、
+   Bocha/Tavily/Jina 和模型凭据。
 3. 执行：
 
 ```bash
@@ -115,7 +116,7 @@ docker compose -f docker/docker-compose.yaml \
   -f docker/docker-compose.deep-research.yaml up -d --build
 ```
 
-生产模式缺失 PostgreSQL、DB Events、Redis、S3 或严格搜索/抽取 Provider
+生产模式缺失 PostgreSQL、DB Events、Redis、S3、语义 Embedding 或严格搜索/抽取 Provider
 时，Gateway 启动检查会失败，不会以降级状态伪装就绪。
 
 ## 验证范围

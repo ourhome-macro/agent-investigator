@@ -475,6 +475,7 @@ async def langgraph_runtime(app: FastAPI, startup_config: AppConfig) -> AsyncGen
         # Initialize repositories — one get_session_factory() call for all.
         sf = get_session_factory()
         if sf is not None:
+            from app.investigations.embeddings import build_embedding_provider
             from app.investigations.exports import ReportExportService
             from app.investigations.orchestration_repository import OrchestrationRepository
             from app.investigations.repository import InvestigationRepository
@@ -485,9 +486,11 @@ async def langgraph_runtime(app: FastAPI, startup_config: AppConfig) -> AsyncGen
 
             app.state.run_store = RunRepository(sf)
             app.state.investigation_artifact_storage = build_artifact_storage()
+            app.state.investigation_embedding_provider = build_embedding_provider()
             app.state.investigation_repo = InvestigationRepository(
                 sf,
                 artifact_storage=app.state.investigation_artifact_storage,
+                embedding_provider=app.state.investigation_embedding_provider,
             )
             app.state.investigation_export_service = ReportExportService(app.state.investigation_artifact_storage)
             app.state.investigation_orchestration_repo = OrchestrationRepository(sf)
@@ -498,6 +501,7 @@ async def langgraph_runtime(app: FastAPI, startup_config: AppConfig) -> AsyncGen
         else:
             app.state.investigation_repo = None
             app.state.investigation_artifact_storage = None
+            app.state.investigation_embedding_provider = None
             app.state.investigation_export_service = None
             app.state.investigation_orchestration_repo = None
             from deerflow.runtime.runs.store.memory import MemoryRunStore

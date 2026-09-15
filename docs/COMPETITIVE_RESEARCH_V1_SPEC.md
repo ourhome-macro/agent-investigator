@@ -44,7 +44,8 @@ agents submit validated domain objects through tools and cannot advance stages.
   verdict. Numeric values absent from supporting quotes are rejected.
 - Pricing Claims are generated only from structured PriceObservations whose
   amount, currency, billing period, and source quote pass exact validation.
-- Analyze uses hybrid BM25 plus hashed n-gram retrieval over immutable chunks;
+- Analyze uses hybrid BM25 plus semantic-vector retrieval over immutable
+  chunks, with deterministic hashed n-grams only as a development fallback;
   Audit receives Claim-specific bindings instead of whole documents.
 
 ## Delivery

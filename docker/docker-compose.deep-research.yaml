@@ -67,6 +67,9 @@ services:
       - CI_S3_ACCESS_KEY=${CI_S3_ACCESS_KEY}
       - CI_S3_SECRET_KEY=${CI_S3_SECRET_KEY}
       - CI_CHROMIUM_PATH=/usr/bin/chromium
+      - CI_EMBEDDING_BASE_URL=${CI_EMBEDDING_BASE_URL:?set CI_EMBEDDING_BASE_URL}
+      - CI_EMBEDDING_API_KEY=${CI_EMBEDDING_API_KEY:?set CI_EMBEDDING_API_KEY}
+      - CI_EMBEDDING_MODEL=${CI_EMBEDDING_MODEL:?set CI_EMBEDDING_MODEL}
       - NO_PROXY=${NO_PROXY:-}${NO_PROXY:+,}localhost,127.0.0.1,::1,gateway,frontend,nginx,redis,postgres,minio,provisioner,host.docker.internal
       - no_proxy=${no_proxy:-}${no_proxy:+,}localhost,127.0.0.1,::1,gateway,frontend,nginx,redis,postgres,minio,provisioner,host.docker.internal
     depends_on:

@@ -1677,7 +1677,7 @@ item-level failure isolation and restart recovery.
 Factual Claims require exact quotes from immutable Evidence snapshots. Pricing
 uses structured observations with exact amount/currency/period validation.
 The workspace supports user material ingestion, persistent audit verdicts,
-token budgets, and server-generated PDF. A production Compose overlay at
+hybrid BM25/semantic retrieval, token budgets, and server-generated PDF. A production Compose overlay at
 `docker/docker-compose.deep-research.yaml` adds PostgreSQL and S3-compatible
 MinIO while reusing Redis; production startup fails closed when required
 infrastructure or providers are missing.
