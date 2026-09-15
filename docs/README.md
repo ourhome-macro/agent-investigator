@@ -44,6 +44,7 @@
 4. [研究闭环问题复核](COMPETITIVE_RESEARCH_CONTROL_LOOP_REVIEW_2026-09-15_ZH.md)：B站案例对应的代码原因。
 5. [下一轮实施建议](COMPETITIVE_RESEARCH_NEXT_ITERATION_2026-09-15_ZH.md)：随后改造采用的计划，具体完成情况看变更记录。
 6. [置信度门槛复核](COMPETITIVE_RESEARCH_CONFIDENCE_POLICY_REVIEW_ZH.md)：来源分级调整的决策依据。
+7. [VerdaAI 源码对照](VERDAAI_SOURCE_REVIEW_2026-09-15_ZH.md)：固定提交的产品设计借鉴与实现边界；未运行对方项目。
 
 `plans/`、`superpowers/` 与 `agents/` 保留既有通用运行时方案；`pr-evidence/` 保存历史检查材料。工作区中被 Git 忽略的本机配置、日志、源码启动笔记不属于公开文档集。
 
