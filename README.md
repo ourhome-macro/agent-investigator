@@ -1686,6 +1686,104 @@ Development may fall back to DDGS. Production research requires at least
 `BOCHA_API_KEY` or `TAVILY_API_KEY`; `JINA_API_KEY` enables full-page extraction.
 See [Competitive Research V1](docs/COMPETITIVE_RESEARCH_V1_SPEC.md).
 
+### Run Competitive Research locally
+
+Complete the normal setup first, then enable durable batches in `config.yaml`:
+
+```yaml
+subagent_batches:
+  enabled: true
+```
+
+The local development stack is started from the repository root:
+
+```bash
+make config
+make install
+make dev
+```
+
+Open `http://localhost:2026/workspace/investigations`, create the administrator
+account when prompted, and choose **Competitive Research**. A new investigation
+first enters `planning`; wait for the proposed scope, review the competitors,
+official domains, markets, dimensions, and time range, then approve the scope.
+The workbench subsequently shows every Run/Batch Item, token usage, Evidence,
+verbatim Claim bindings, audit verdicts, structured pricing, and targeted
+rework. The final report still requires explicit publish approval.
+
+After an approved scope, a failed task can start a bounded technical recovery
+from its last failed stage without consuming a business rework round. When a
+budget or execution failure cannot continue, **Generate uncertainty report**
+creates an eleven-section `partial=true` report from accepted domain state;
+unaudited Claims remain uncertain and publication still requires approval.
+
+For separate local ports, start the Gateway and Frontend independently:
+
+```bash
+cd backend
+uv run --no-sync uvicorn app.gateway.app:app --host 127.0.0.1 --port 18001
+
+cd frontend
+DEER_FLOW_INTERNAL_GATEWAY_BASE_URL=http://127.0.0.1:18001 pnpm build
+DEER_FLOW_INTERNAL_GATEWAY_BASE_URL=http://127.0.0.1:18001 pnpm start --port 13000
+```
+
+The Windows equivalent uses PowerShell environment assignment before the
+frontend command:
+
+```powershell
+$env:DEER_FLOW_INTERNAL_GATEWAY_BASE_URL = "http://127.0.0.1:18001"
+pnpm build
+pnpm start --port 13000
+```
+
+The URL must be present during `pnpm build` because Next.js compiles production
+rewrite destinations into the build output. Changing it only before
+`pnpm start` leaves the previous Gateway destination in place.
+
+### Evidence and model configuration
+
+Keep all credentials in the ignored `.env`; never put literal keys in
+`config.yaml`. The default planning/audit/synthesis model and the Flash model
+used by collectors/analysts must both be present in the `models` section.
+
+Development can run with DDGS, direct extraction, local Chromium, and hashed
+n-gram retrieval. A production run intentionally fails startup unless the
+following are configured:
+
+- PostgreSQL through `database.backend: postgres` and `$DATABASE_URL`;
+- DB-backed Run Events and Redis StreamBridge;
+- Bocha or Tavily, plus Jina;
+- S3-compatible Snapshot/PDF storage;
+- an OpenAI-compatible semantic Embedding endpoint;
+- SSRF-guarded Playwright and Chromium.
+
+Use the production overlay after configuring the required variables shown in
+`.env.example`:
+
+```bash
+docker compose -f docker/docker-compose.yaml \
+  -f docker/docker-compose.deep-research.yaml up -d --build
+```
+
+### Example: Bilibili player competitive research
+
+A useful acceptance case is a third-party Bilibili-focused player. Use a brief
+similar to:
+
+> Evaluate a privacy-conscious, cross-platform Bilibili player for desktop and
+> mobile. Compare official Bilibili clients and relevant open-source players on
+> playback, account dependence, advertisements, danmaku, downloads, TV/casting,
+> extensibility, maintenance, compliance risk, and monetization. Distinguish
+> verified facts from unknowns and recommend a differentiated MVP.
+
+Do not pre-fill conclusions. Let Planning propose 2-5 competitors, verify their
+official domains or repositories, and approve the scope manually. The expected
+deliverable is an eleven-section report whose factual Claims have exact Snapshot
+quotes and whose unresolved ecosystem or copyright questions remain explicitly
+`uncertain`. A completed sample is maintained in
+[Bilibili Player Competitive Research](docs/BILIBILI_PLAYER_COMPETITIVE_RESEARCH_ZH.md).
+
 ## License
 
 This project is open source and available under the [MIT License](./LICENSE).

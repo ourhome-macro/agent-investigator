@@ -963,6 +963,14 @@ class SubagentExecutor:
             "available_skills": self._available_skill_names,
             "user_id": self.user_id or DEFAULT_USER_ID,
         }
+        if self.config.token_budget_max_tokens is not None:
+            from deerflow.config.token_budget_config import TokenBudgetConfig
+
+            middleware_kwargs["token_budget_override"] = TokenBudgetConfig(
+                enabled=True,
+                max_tokens=self.config.token_budget_max_tokens,
+                warn_threshold=0.75,
+            )
         if extensions is not None:
             middleware_kwargs["extensions"] = extensions
         authz_provider = getattr(self, "_authz_provider", None)

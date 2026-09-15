@@ -74,6 +74,7 @@ async def test_run_adapter_launches_normal_run_and_accepts_correlated_submission
     assert receipt.token_usage == {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
     assert bound == ["run-1"]
     assert launch_calls[0]["assistant_id"] == "lead_agent"
+    assert launch_calls[0]["thread_id"] == f"ci-{task.investigation_id}-{task.task_id}"
     assert launch_calls[0]["metadata"]["ci_task_id"] == task.task_id
 
 

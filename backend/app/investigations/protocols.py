@@ -8,6 +8,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from app.investigations.contracts import ResearchScope
+
 PROTOCOL_VERSION = "ci-agent-v1"
 
 
@@ -81,8 +83,10 @@ class DomainSubmission(BaseModel):
             values = self.payload.get(required_list)
             if not isinstance(values, list) or not all(isinstance(item, dict) for item in values):
                 raise ValueError(f"{self.kind.value} submission requires payload.{required_list} as an object list")
-        if self.kind == SubmissionKind.SCOPE and not isinstance(self.payload.get("scope"), dict):
-            raise ValueError("scope submission requires payload.scope")
+        if self.kind == SubmissionKind.SCOPE:
+            if not isinstance(self.payload.get("scope"), dict):
+                raise ValueError("scope submission requires payload.scope")
+            ResearchScope.model_validate(self.payload["scope"])
         if self.kind == SubmissionKind.AUDIT:
             for field in ("binding_verdicts", "issues"):
                 values = self.payload.get(field)

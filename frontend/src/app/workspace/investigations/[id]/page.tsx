@@ -10,12 +10,14 @@ import {
   approveScope,
   getInvestigation,
   getLatestReport,
+  finalizePartialReport,
   listAuditIssues,
   listClaims,
   listEvidence,
   listPricing,
   listStageItems,
   rejectReport,
+  retryInvestigation,
   uploadMaterial,
   type AuditIssue,
   type Claim,
@@ -143,6 +145,41 @@ export default function InvestigationPage() {
           </Button>
         </section>
       )}
+      {investigation.status === "failed" &&
+        investigation.failure_retry_count < 2 && (
+          <section className="border-destructive/40 rounded-xl border p-6">
+            <h2 className="text-xl font-medium">执行失败</h2>
+            <p className="text-muted-foreground mt-2 text-sm">
+              修复 Provider、预算或 Agent 配置后，可以保留当前 Scope 和 Evidence
+              启动新的恢复轮次。
+            </p>
+            <Button
+              className="mt-4"
+              variant="destructive"
+              onClick={() =>
+                void retryInvestigation(id)
+                  .then(setInvestigation)
+                  .catch((reason: Error) => setError(reason.message))
+              }
+            >
+              重试失败任务
+            </Button>
+            <Button
+              className="mt-4 ml-2"
+              variant="outline"
+              onClick={() =>
+                void finalizePartialReport(id)
+                  .then((nextReport) => {
+                    setReport(nextReport);
+                    return load();
+                  })
+                  .catch((reason: Error) => setError(reason.message))
+              }
+            >
+              生成不确定性报告
+            </Button>
+          </section>
+        )}
       <section className="grid gap-4 md:grid-cols-5">
         {[
           ["证据", evidence.length],

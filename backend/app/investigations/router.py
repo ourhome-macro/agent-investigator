@@ -117,6 +117,25 @@ async def cancel_investigation(investigation_id: str, request: Request):
     return result
 
 
+@router.post("/{investigation_id}/retry", status_code=status.HTTP_202_ACCEPTED)
+async def retry_failed_investigation(investigation_id: str, body: ApprovalRequest, request: Request):
+    user_id = _user_id()
+    try:
+        result = await _repo(request).retry_failed(
+            investigation_id,
+            user_id=user_id,
+            idempotency_key=body.idempotency_key,
+        )
+    except (InvestigationConflict, RuntimeError) as exc:
+        raise _conflict(exc) from exc
+    if result is None:
+        raise _not_found()
+    service = getattr(request.app.state, "investigation_workflow_service", None)
+    if service is not None:
+        service.enqueue(investigation_id, user_id)
+    return result
+
+
 @router.get("/{investigation_id}/events")
 async def list_events(investigation_id: str, request: Request, after_seq: int = Query(default=0, ge=0), limit: int = Query(default=500, ge=1, le=2000)):
     result = await _repo(request).list_events(investigation_id, user_id=_user_id(), after_seq=after_seq, limit=limit)
@@ -308,6 +327,30 @@ async def _start_rework(investigation_id: str, body: ReworkRequest, request: Req
     if service is not None:
         service.enqueue(investigation_id, user_id)
     return result
+
+
+@router.post("/{investigation_id}/reports/finalize-partial")
+async def finalize_partial_report(investigation_id: str, request: Request):
+    from app.investigations.partial_report import build_partial_report
+
+    user_id = _user_id()
+    repository = _repo(request)
+    investigation = await repository.get(investigation_id, user_id=user_id)
+    if investigation is None:
+        raise _not_found()
+    if investigation["status"] != InvestigationStatus.FAILED.value:
+        raise HTTPException(status_code=409, detail="Partial finalization is available only for failed Investigations")
+    claims = await repository.list_claims(investigation_id, user_id=user_id) or []
+    evidence = await repository.list_evidence(investigation_id, user_id=user_id) or []
+    issues = await repository.list_audit_issues(investigation_id, user_id=user_id) or []
+    structured, markdown = build_partial_report(investigation, claims, evidence, issues)
+    return await repository.create_report(
+        investigation_id,
+        structured_data=structured,
+        rendered_markdown=markdown,
+        user_id=user_id,
+        allow_failed_partial=True,
+    )
 
 
 @router.post("/{investigation_id}/reports/{version}/reject")

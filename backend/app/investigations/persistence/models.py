@@ -26,6 +26,7 @@ class InvestigationRow(InvestigationBase):
     status: Mapped[str] = mapped_column(String(48), index=True)
     workflow_version: Mapped[str] = mapped_column(String(32), default="competitive-research-v1")
     rework_round: Mapped[int] = mapped_column(Integer, default=0)
+    failure_retry_count: Mapped[int] = mapped_column(Integer, default=0)
     token_used: Mapped[int] = mapped_column(Integer, default=0)
     token_budget: Mapped[int] = mapped_column(Integer, default=300_000)
     deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

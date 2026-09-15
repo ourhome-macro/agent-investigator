@@ -93,7 +93,11 @@ class InvestigationWorkflowService:
                     workflow = await self._orchestration.ensure_workflow(
                         investigation_id,
                         user_id=user_id,
-                        idempotency_key=(f"{investigation_id}:planning" if investigation["status"] == InvestigationStatus.PLANNING.value else f"{investigation_id}:execution:round:{investigation['rework_round']}"),
+                        idempotency_key=(
+                            f"{investigation_id}:planning"
+                            if investigation["status"] == InvestigationStatus.PLANNING.value
+                            else (f"{investigation_id}:execution:round:{investigation['rework_round']}:recovery:{investigation['failure_retry_count']}")
+                        ),
                     )
                     claimed = await self._orchestration.claim_workflow(
                         workflow["id"],
@@ -101,6 +105,12 @@ class InvestigationWorkflowService:
                         lease_seconds=self._lease_seconds,
                     )
                     if claimed is None:
+                        asyncio.get_running_loop().call_later(
+                            self._lease_seconds / 3,
+                            self.enqueue,
+                            investigation_id,
+                            user_id,
+                        )
                         continue
                     heartbeat = asyncio.create_task(self._heartbeat(workflow["id"]), name=f"ci-heartbeat-{workflow['id']}")
                     execution = asyncio.create_task(

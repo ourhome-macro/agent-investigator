@@ -50,13 +50,19 @@ class DurableStageBatchAdapter:
             StageName.ANALYZING: "submit_claims",
         }.get(tasks[0].stage)
         allowed_tools = [submission_tool] if submission_tool else []
-        if tasks[0].stage in {StageName.COLLECTING, StageName.REWORKING}:
-            allowed_tools = ["web_search", "web_fetch", *allowed_tools]
+        item_token_budget = 35_000 if tasks[0].stage in {StageName.COLLECTING, StageName.REWORKING} else 30_000
         config = replace(
             config,
             model=model_name,
             tools=allowed_tools,
             disallowed_tools=["task", "batch_task"],
+            skills=[],
+            # LangGraph recursion steps include middleware/tool routing nodes;
+            # six steps can terminate before the first model/tool round-trip.
+            # The independent token budget remains the real cost ceiling.
+            max_turns=20,
+            timeout_seconds=240,
+            token_budget_max_tokens=item_token_budget,
         )
         items: list[BatchItemInput] = [
             {
@@ -116,12 +122,34 @@ class DurableStageBatchAdapter:
         task_by_key = {task.item_key: task for task in tasks}
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout_seconds
+        visible_statuses: dict[str, str] = {}
         while True:
             batch = await self._service.get_batch(batch_id=batch_id, user_id=user_id)
             if batch is None:
                 raise DurableBatchUnavailable("Durable batch disappeared")
             if batch["status"] in {"completed", "failed", "cancelled"}:
                 break
+            progress_rows = await self._batch_repository.list_items(
+                batch_id,
+                user_id=user_id,
+                offset=0,
+                limit=max(100, len(tasks)),
+                include_prompt=False,
+                include_result=False,
+            )
+            for progress in progress_rows or []:
+                raw_status = progress.get("status")
+                mapped_status = "running" if raw_status in {"leased", "running"} else raw_status if raw_status in {"succeeded", "failed", "cancelled"} else "pending"
+                item_key = progress.get("item_key")
+                if item_key in task_by_key and visible_statuses.get(item_key) != mapped_status:
+                    visible_statuses[item_key] = mapped_status
+                    await self._orchestration.update_stage_item(
+                        stage_attempt_id,
+                        item_key=item_key,
+                        status=mapped_status,
+                        attempt=max(0, int(progress.get("attempt") or 0)),
+                        error=progress.get("error"),
+                    )
             if loop.time() >= deadline:
                 await self._service.cancel_batch(batch_id=batch_id, user_id=user_id)
                 raise TimeoutError(f"Durable batch {batch_id} exceeded stage timeout")
@@ -157,8 +185,21 @@ class DurableStageBatchAdapter:
                     status = ReceiptStatus.SUCCEEDED
                     submissions.append(submission)
                 elif hasattr(self._orchestration, "get_stage_submission"):
-                    status = ReceiptStatus.REJECTED
-                    error = "Agent did not use its required domain submission tool"
+                    try:
+                        parsed = parse_domain_submission(row.get("result") or "")
+                        parsed.require_matches(task)
+                        submission = await self._orchestration.submit_domain_submission(
+                            task_id=task.task_id,
+                            user_id=user_id,
+                            kind=parsed.kind,
+                            payload=parsed.payload,
+                            warnings=parsed.warnings,
+                        )
+                        status = ReceiptStatus.SUCCEEDED
+                        submissions.append(submission)
+                    except Exception as exc:
+                        status = ReceiptStatus.REJECTED
+                        error = f"Agent neither used its domain tool nor returned a valid DomainSubmission: {exc}"
                 else:
                     try:
                         submission = parse_domain_submission(row.get("result") or "")

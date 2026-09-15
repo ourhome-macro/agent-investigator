@@ -1,0 +1,29 @@
+{
+  "investigation_type": "competitive_research",
+  "title": "B站播放器竞品分析与产品机会研究",
+  "brief": "研究一款面向中国用户、强调无广告与隐私、支持桌面和移动端的第三方 Bilibili 播放器。重点比较播放体验、登录依赖、弹幕、收藏与历史、离线缓存、投屏和电视端、扩展性、维护活跃度、商业化空间，以及平台条款、版权和接口稳定性风险。所有结论必须区分已验证事实、第三方信息和未知项，并给出可执行的差异化 MVP 建议。",
+  "scope": {
+    "market": "中国大陆为主，兼顾海外中文用户",
+    "audience": "重度 Bilibili 用户、跨设备观看用户、注重隐私与纯净体验的用户",
+    "language": "zh-CN",
+    "time_range": "截至2026年9月的当前公开信息，重点关注最近24个月",
+    "competitors": [
+      "哔哩哔哩官方客户端",
+      "PiliPala",
+      "BBLL",
+      "Kazumi"
+    ],
+    "dimensions": [
+      "播放与弹幕体验",
+      "账号、离线与跨设备",
+      "开源、扩展与维护",
+      "合规风险与商业化"
+    ],
+    "official_domains": {
+      "哔哩哔哩官方客户端": ["bilibili.com"],
+      "PiliPala": ["github.com"],
+      "BBLL": ["github.com"],
+      "Kazumi": ["github.com"]
+    }
+  }
+}

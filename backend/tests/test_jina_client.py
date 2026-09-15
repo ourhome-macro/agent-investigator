@@ -126,6 +126,20 @@ async def test_crawl_passes_headers(jina_client, monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_placeholder_api_key_is_not_sent(jina_client, monkeypatch):
+    monkeypatch.setenv("JINA_API_KEY", "your-jina-api-key")
+    captured_headers = {}
+
+    async def mock_post(self, url, **kwargs):
+        captured_headers.update(kwargs.get("headers", {}))
+        return httpx.Response(200, text="ok", request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+    await jina_client.crawl("https://example.com")
+    assert "Authorization" not in captured_headers
+
+
+@pytest.mark.anyio
 async def test_crawl_passes_proxy_to_httpx_client(jina_client, monkeypatch):
     """Explicit proxy config should be passed to httpx.AsyncClient."""
     captured_client_kwargs = {}

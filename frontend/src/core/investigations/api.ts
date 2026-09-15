@@ -68,6 +68,16 @@ export async function cancelInvestigation(id: string): Promise<Investigation> {
   );
 }
 
+export async function retryInvestigation(id: string): Promise<Investigation> {
+  return json(
+    await fetch(`/api/investigations/${encodeURIComponent(id)}/retry`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ idempotency_key: crypto.randomUUID() }),
+    }),
+  );
+}
+
 export async function listEvidence(id: string): Promise<Evidence[]> {
   return json(
     await fetch(`/api/investigations/${encodeURIComponent(id)}/evidence`),
@@ -112,6 +122,15 @@ export async function getLatestReport(id: string): Promise<Report | null> {
   );
   if (response.status === 404) return null;
   return json(response);
+}
+
+export async function finalizePartialReport(id: string): Promise<Report> {
+  return json(
+    await fetch(
+      `/api/investigations/${encodeURIComponent(id)}/reports/finalize-partial`,
+      { method: "POST" },
+    ),
+  );
 }
 
 export async function listStageItems(id: string): Promise<StageItem[]> {

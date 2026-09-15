@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from langchain.tools import tool
 
+from app.investigations.contracts import ResearchScope
 from app.investigations.domain_runtime import get_domain_submission_handler
 from app.investigations.protocols import SubmissionKind
 from deerflow.runtime.user_context import resolve_runtime_user_id
@@ -23,10 +24,16 @@ async def _submit(runtime: Runtime, *, task_id: str, kind: SubmissionKind, paylo
 
 
 @tool("submit_scope")
-async def submit_scope_tool(runtime: Runtime, task_id: str, scope: dict, warnings: list[str] | None = None) -> str:
+async def submit_scope_tool(runtime: Runtime, task_id: str, scope: ResearchScope, warnings: list[str] | None = None) -> str:
     """Submit one typed Competitive Research scope proposal for the active task."""
 
-    return await _submit(runtime, task_id=task_id, kind=SubmissionKind.SCOPE, payload={"scope": scope}, warnings=warnings)
+    return await _submit(
+        runtime,
+        task_id=task_id,
+        kind=SubmissionKind.SCOPE,
+        payload={"scope": scope.model_dump(mode="json")},
+        warnings=warnings,
+    )
 
 
 @tool("submit_evidence")

@@ -60,6 +60,9 @@ Claim views must display verbatim quote validation and entailment status rather
 than only citation counts. Pricing uses the structured pricing endpoint, user
 materials enter through the Investigation upload endpoint, and PDF downloads
 use the server export route rather than browser print.
+Failed investigations expose bounded technical recovery and partial uncertainty
+report actions. Batch Item state should update while the batch is running, not
+only after terminal receipts arrive.
 
 ```
 Frontend (Next.js) ──▶ LangGraph SDK ──▶ LangGraph Backend (lead_agent)

@@ -35,6 +35,7 @@ export interface Investigation {
   workflow_version: string;
   scope: ResearchScope;
   rework_round: number;
+  failure_retry_count: number;
   token_used: number;
   token_budget: number;
   deadline_at: string | null;

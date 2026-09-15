@@ -10,7 +10,7 @@ from app.investigations.orchestration_repository import OrchestrationRepository
 from app.investigations.orchestrator import DurableCompetitiveOrchestrator
 from app.investigations.persistence import upgrade_investigation_schema
 from app.investigations.protocols import AgentReceipt, ReceiptStatus, StageName, SubmissionKind
-from app.investigations.providers import SourceDocument, SourceType
+from app.investigations.providers import SearchHit, SourceDocument, SourceType
 from app.investigations.repository import InvestigationRepository
 
 
@@ -43,6 +43,17 @@ def _receipt(task, *, run_id=None, batch_id=None, item_id=None, model="scripted"
 
 
 class ScriptedProviders:
+    async def search(self, query: str, *, max_results: int):
+        return [
+            SearchHit(
+                title=f"Scripted {index}",
+                url=f"https://source-{index}.example/docs",
+                content=f"Evidence for {query}",
+                provider="scripted",
+            )
+            for index in range(max_results)
+        ]
+
     async def fetch_url(self, url: str, *, fallback_content: str, investigation_id: str):
         del investigation_id
         return SourceDocument(

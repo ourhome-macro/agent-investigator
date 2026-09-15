@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import inspect, text
+from sqlalchemy import event, inspect, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.investigations.contracts import ClaimCreate, EvidenceCreate, InvestigationCreate, InvestigationStatus, InvestigationType, ResearchScope
@@ -19,8 +19,12 @@ from app.investigations.state_machine import InvalidInvestigationTransition, req
 
 
 def test_scope_requires_two_to_five_unique_competitors() -> None:
-    scope = ResearchScope(competitors=["Acme", "acme", "Beta"])
+    scope = ResearchScope(
+        competitors=["Acme", "acme", "Beta"],
+        official_domains={"Acme": ["https://www.acme.com/pricing", "acme.com/docs"]},
+    )
     assert scope.competitors == ["Acme", "Beta"]
+    assert scope.official_domains == {"Acme": ["acme.com"]}
     with pytest.raises(ValidationError):
         ResearchScope(competitors=["Only one"])
 
@@ -70,7 +74,7 @@ async def test_independent_migration_and_repository_round_trip(tmp_path) -> None
         assert "ci_investigations" in tables
         assert "ci_claim_evidence" in tables
         assert "ci_stage_items" in tables
-        assert version == "ci_0008"
+        assert version == "ci_0009"
 
         repository = InvestigationRepository(async_sessionmaker(engine, expire_on_commit=False))
         created = await repository.create(
@@ -299,6 +303,63 @@ def test_canonical_url_removes_tracking_and_fragment() -> None:
     assert canonicalize_url("HTTPS://Example.COM/path?utm_source=x&id=1#part") == "https://example.com/path?id=1"
 
 
+@pytest.mark.asyncio
+async def test_create_flushes_investigation_before_fk_children(tmp_path) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'foreign-keys.db'}")
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def enable_foreign_keys(connection, _record) -> None:
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    try:
+        await upgrade_investigation_schema(engine)
+        repository = InvestigationRepository(async_sessionmaker(engine, expire_on_commit=False))
+        created = await repository.create(
+            InvestigationCreate(
+                title="Foreign key ordering",
+                brief="Exercise the exact SQLite settings used by the running Gateway.",
+                scope=ResearchScope(competitors=["Acme", "Beta"]),
+            ),
+            user_id="user-1",
+        )
+        assert created["scope"]["competitors"] == ["Acme", "Beta"]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_failed_approved_execution_can_start_recovery_round(tmp_path) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'recovery.db'}")
+    try:
+        await upgrade_investigation_schema(engine)
+        repository = InvestigationRepository(async_sessionmaker(engine, expire_on_commit=False))
+        created = await repository.create(
+            InvestigationCreate(
+                title="Recovery",
+                brief="Retry a failed execution without repeating the approved planning run.",
+                scope=ResearchScope(competitors=["Acme", "Beta"]),
+            ),
+            user_id="user-1",
+        )
+        await repository.complete_planning(created["id"], ResearchScope.model_validate(created["scope"]), user_id="user-1", run_id="planning-run")
+        await repository.approve_scope(created["id"], user_id="user-1", idempotency_key="approve-recovery")
+        await repository.transition(
+            created["id"],
+            InvestigationStatus.FAILED,
+            user_id="user-1",
+            event_type="ci.failed",
+        )
+        retried = await repository.retry_failed(created["id"], user_id="user-1", idempotency_key="retry-recovery")
+        assert retried is not None
+        assert retried["status"] == "collecting"
+        assert retried["rework_round"] == 0
+        assert retried["failure_retry_count"] == 1
+    finally:
+        await engine.dispose()
+
+
 def test_stage_protocol_requires_exact_task_correlation() -> None:
     task = StageTask(
         task_id="task-0001",
@@ -327,6 +388,17 @@ def test_stage_protocol_requires_exact_task_correlation() -> None:
     mismatched = submission.model_copy(update={"item_key": "other"})
     with pytest.raises(ValueError, match="item_key"):
         mismatched.require_matches(task)
+
+    with pytest.raises(ValueError, match="valid string"):
+        DomainSubmission(
+            task_id="planning-task-1",
+            investigation_id="investigation-0001",
+            workflow_run_id="workflow-0001",
+            stage=StageName.PLANNING,
+            item_key="scope-draft",
+            kind=SubmissionKind.SCOPE,
+            payload={"scope": {"competitors": [{"name": "Acme"}, {"name": "Beta"}]}},
+        )
 
 
 @pytest.mark.asyncio

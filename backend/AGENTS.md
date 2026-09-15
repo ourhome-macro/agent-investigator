@@ -422,3 +422,12 @@ owner- and active-stage-scoped. Early stages reserve 20% of the token budget.
 Production mode requires Postgres, DB Run Events, Redis, S3-compatible storage,
 an OpenAI-compatible semantic Embedding provider, strict web providers, and
 SSRF-guarded Playwright. Hashed n-gram embeddings are development fallback only.
+
+Live Competitive Research hardening: server-side Provider search feeds one
+Collector Item per competitor; collectors do not run open-ended search loops.
+Stage Item token caps are carried in `SubagentConfig`. Strip embeddings before
+Agent context, isolate ordinary Runs by StageTask thread, and keep technical
+`failure_retry_count` separate from business `rework_round`. A valid final
+DomainSubmission may be routed by the adapter through the same domain handler
+when a model omits the tool call. Failed/budget-exhausted work may produce only
+a `partial=true` uncertainty report and must not upgrade unaudited Claims.

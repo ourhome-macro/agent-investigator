@@ -16,8 +16,9 @@ class JinaClient:
             "X-Return-Format": return_format,
             "X-Timeout": str(timeout),
         }
-        if os.getenv("JINA_API_KEY"):
-            headers["Authorization"] = f"Bearer {os.getenv('JINA_API_KEY')}"
+        api_key = (os.getenv("JINA_API_KEY") or "").strip()
+        if api_key and not api_key.startswith(("your-", "replace-")):
+            headers["Authorization"] = f"Bearer {api_key}"
         elif not _api_key_warned:
             _api_key_warned = True
             logger.warning("Jina API key is not set. Provide your own key to access a higher rate limit. See https://jina.ai/reader for more information.")

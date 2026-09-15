@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
 
@@ -87,7 +88,17 @@ class ResearchScope(BaseModel):
         competitor_names = {name.casefold() for name in self.competitors}
         if any(name.casefold() not in competitor_names for name in self.official_domains):
             raise ValueError("official_domains keys must match scoped competitors")
-        self.official_domains = {name: sorted({domain.strip().lower().removeprefix("www.") for domain in domains if "." in domain}) for name, domains in self.official_domains.items()}
+        normalized_domains: dict[str, list[str]] = {}
+        for name, domains in self.official_domains.items():
+            normalized: set[str] = set()
+            for domain in domains:
+                value = domain.strip().lower()
+                parsed = urlsplit(value if "://" in value else f"//{value}")
+                hostname = (parsed.hostname or "").removeprefix("www.")
+                if "." in hostname:
+                    normalized.add(hostname)
+            normalized_domains[name] = sorted(normalized)
+        self.official_domains = normalized_domains
         return self
 
 
@@ -110,6 +121,7 @@ class InvestigationSummary(BaseModel):
     workflow_version: str
     scope: ResearchScope
     rework_round: int
+    failure_retry_count: int
     token_used: int
     token_budget: int
     deadline_at: datetime | None = None

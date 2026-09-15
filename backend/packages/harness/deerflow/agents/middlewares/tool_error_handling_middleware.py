@@ -348,6 +348,7 @@ def build_subagent_runtime_middlewares(
     deferred_setup: "DeferredToolSetup | None" = None,
     mcp_routing_middleware: AgentMiddleware | None = None,
     agent_name: str | None = None,
+    token_budget_override=None,
     available_skills: set[str] | None = None,
     user_id: str | None = None,
     authorization_provider=None,
@@ -469,7 +470,9 @@ def build_subagent_runtime_middlewares(
     # per-agent) always wins, so a deployment that pinned a value is never
     # silently changed by flipping the summarization switch.
     summarization_enabled = app_config.summarization.enabled
-    if agent_name is not None:
+    if token_budget_override is not None:
+        token_budget_config = token_budget_override
+    elif agent_name is not None:
         token_budget_config = app_config.subagents.get_token_budget_for(agent_name, summarization_enabled=summarization_enabled)
     else:
         token_budget_config = app_config.subagents.token_budget

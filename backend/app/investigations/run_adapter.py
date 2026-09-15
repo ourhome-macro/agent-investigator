@@ -62,7 +62,7 @@ class DeerFlowRunStageAdapter:
         if existing_run_id is None:
             launched = await self._launch_run(
                 app=self._app,
-                thread_id=f"ci-{task.investigation_id}",
+                thread_id=f"ci-{task.investigation_id}-{task.task_id}",
                 assistant_id="lead_agent",
                 prompt=render_stage_prompt(task, instruction),
                 owner_user_id=user_id,

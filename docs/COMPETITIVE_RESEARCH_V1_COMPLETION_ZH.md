@@ -125,3 +125,22 @@ docker compose -f docker/docker-compose.yaml \
 SSRF、预算幂等、工具 Owner 隔离、Lease 接管、存储路径逃逸、HTML XSS、
 完整 Durable Workflow 和 Gateway 生命周期。真实 Provider 的内容质量仍需
 持续用黄金集回归；模型或抓取 Provider 变更不得绕过上述硬门槛。
+
+## 真实 B站播放器连调加固
+
+2026-09-15 使用 B站播放器案例完成真实 Gateway、Frontend 和 DeepSeek 连调，
+并据此补齐以下非模拟问题：
+
+- SQLite 开启 Foreign Key 时先 Flush Investigation，再写 Scope/Competitor；
+- `submit_scope` 在工具边界验证 ResearchScope，拒绝对象型 Competitor 和带仓库路径的 Domain；
+- Collect 改为服务器搜索、每竞品一个 Durable Item，Agent 只做候选筛选；
+- Collector/Analyst 使用独立 Turn、Timeout 和 Token 上限，并关闭无关技能上下文；
+- 合法最终 DomainSubmission JSON 通过与领域工具相同的 Owner/Stage/Schema/Idempotency 入口提交；
+- 检索结果进入 Agent 前移除 Embedding 数组，Audit/Synthesis 使用紧凑 Claim 包；
+- 每个 StageTask 使用独立 Thread，避免 Planning/Audit 历史反复进入上下文；
+- 技术失败次数与业务返工轮次分离，Lease 未到期时延迟重新入队；
+- 预算耗尽或失败时可生成 `partial=true` 的 11 章节不确定性报告；
+- Batch 运行期间同步 Item 状态到工作台。
+
+完整独立报告见
+[B站播放器竞品分析与产品机会研究](BILIBILI_PLAYER_COMPETITIVE_RESEARCH_ZH.md)。

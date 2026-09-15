@@ -42,6 +42,8 @@ from app.investigations.persistence.models import (
     ReportRow,
     ReportSectionRow,
     ScopeRow,
+    StageAttemptRow,
+    WorkflowRunRow,
 )
 from app.investigations.retrieval import chunk_snapshot, hashed_embedding, rank_chunks
 from app.investigations.scoring import credibility_score, independent_source_count
@@ -94,6 +96,7 @@ class InvestigationRepository:
                 brief=request.brief,
                 status=InvestigationStatus.PLANNING.value,
                 workflow_version="competitive-research-v1",
+                token_budget=min(525_000, 300_000 + max(0, len(request.scope.competitors) - 2) * 75_000),
                 deadline_at=now + timedelta(minutes=30),
                 created_at=now,
                 updated_at=now,
@@ -110,7 +113,12 @@ class InvestigationRepository:
                 created_at=now,
                 updated_at=now,
             )
-            session.add_all([row, scope])
+            # Flush the parent explicitly. Gateway SQLite enables foreign-key
+            # enforcement, and these models intentionally have no ORM
+            # relationships from which SQLAlchemy could infer flush ordering.
+            session.add(row)
+            await session.flush()
+            session.add(scope)
             for name in request.scope.competitors:
                 session.add(
                     CompetitorRow(
@@ -787,7 +795,8 @@ class InvestigationRepository:
         query_embedding = None
         if self._embedding_provider is not None:
             query_embedding = (await self._embedding_provider.embed_texts([query]))[0]
-        return rank_chunks(query, chunks, limit=limit, query_embedding=query_embedding)
+        ranked = rank_chunks(query, chunks, limit=limit, query_embedding=query_embedding)
+        return [{key: value for key, value in chunk.items() if key != "embedding"} for chunk in ranked]
 
     async def supplement_claim_evidence(
         self,
@@ -934,6 +943,58 @@ class InvestigationRepository:
             )
         return await self.get(investigation_id, user_id=user_id)
 
+    async def retry_failed(self, investigation_id: str, *, user_id: str, idempotency_key: str) -> dict[str, Any] | None:
+        async with self._sf() as session, session.begin():
+            investigation = await session.get(InvestigationRow, investigation_id, with_for_update=True)
+            if investigation is None or investigation.user_id != user_id:
+                return None
+            if investigation.status != InvestigationStatus.FAILED.value:
+                raise InvestigationConflict("Only failed Investigations can start a recovery round")
+            scope = (await session.execute(select(ScopeRow).where(ScopeRow.investigation_id == investigation_id))).scalar_one()
+            if scope.approved_at is None:
+                raise InvestigationConflict("Failed Planning must be recreated; only approved execution can be retried")
+            if investigation.failure_retry_count >= 2:
+                raise InvestigationConflict("Maximum technical recovery attempts reached")
+            if investigation.token_used >= investigation.token_budget:
+                raise InvestigationBudgetExceeded("Investigation token budget is already exhausted")
+            failed_stage = (
+                await session.execute(
+                    select(StageAttemptRow.stage)
+                    .join(WorkflowRunRow, WorkflowRunRow.id == StageAttemptRow.workflow_run_id)
+                    .where(
+                        WorkflowRunRow.investigation_id == investigation_id,
+                        StageAttemptRow.status == "failed",
+                    )
+                    .order_by(StageAttemptRow.created_at.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            resume_status = {
+                "collecting": InvestigationStatus.COLLECTING,
+                "reworking": InvestigationStatus.REWORKING,
+                "analyzing": InvestigationStatus.ANALYZING,
+                "auditing": InvestigationStatus.AUDITING,
+                "synthesizing": InvestigationStatus.SYNTHESIZING,
+            }.get(failed_stage or "", InvestigationStatus.COLLECTING)
+            investigation.failure_retry_count += 1
+            investigation.status = resume_status.value
+            investigation.error = None
+            investigation.updated_at = datetime.now(UTC)
+            session.add(
+                InvestigationEventRow(
+                    investigation_id=investigation_id,
+                    event_type="ci.rework.requested",
+                    stage=resume_status.value,
+                    payload={
+                        "source": "failed_workflow_recovery",
+                        "recovery_attempt": investigation.failure_retry_count,
+                        "resume_stage": resume_status.value,
+                        "idempotency_key": idempotency_key,
+                    },
+                )
+            )
+        return await self.get(investigation_id, user_id=user_id)
+
     async def list_audit_issues(self, investigation_id: str, *, user_id: str, status: str | None = None) -> list[dict[str, Any]] | None:
         if await self.get(investigation_id, user_id=user_id) is None:
             return None
@@ -987,7 +1048,15 @@ class InvestigationRepository:
                 }
             )
 
-    async def create_report(self, investigation_id: str, *, structured_data: dict[str, Any], rendered_markdown: str, user_id: str) -> dict[str, Any] | None:
+    async def create_report(
+        self,
+        investigation_id: str,
+        *,
+        structured_data: dict[str, Any],
+        rendered_markdown: str,
+        user_id: str,
+        allow_failed_partial: bool = False,
+    ) -> dict[str, Any] | None:
         if await self.get(investigation_id, user_id=user_id) is None:
             return None
         async with self._sf() as session, session.begin():
@@ -1012,9 +1081,21 @@ class InvestigationRepository:
             assert investigation is not None
             current = InvestigationStatus(investigation.status)
             if current != InvestigationStatus.AWAITING_PUBLISH_APPROVAL:
-                require_transition(current, InvestigationStatus.AWAITING_PUBLISH_APPROVAL)
+                if not (allow_failed_partial and current == InvestigationStatus.FAILED):
+                    require_transition(current, InvestigationStatus.AWAITING_PUBLISH_APPROVAL)
                 investigation.status = InvestigationStatus.AWAITING_PUBLISH_APPROVAL.value
-            session.add(InvestigationEventRow(investigation_id=investigation_id, event_type="ci.report.ready_for_review", stage="awaiting_publish_approval", payload={"report_id": report.id, "version": report.version}))
+            session.add(
+                InvestigationEventRow(
+                    investigation_id=investigation_id,
+                    event_type="ci.report.ready_for_review",
+                    stage="awaiting_publish_approval",
+                    payload={
+                        "report_id": report.id,
+                        "version": report.version,
+                        "partial": bool(structured_data.get("partial")),
+                    },
+                )
+            )
         return await self.latest_report(investigation_id, user_id=user_id)
 
     async def record_export(
@@ -1142,6 +1223,7 @@ class InvestigationRepository:
                 "approved_at": scope.approved_at,
             },
             "rework_round": row.rework_round,
+            "failure_retry_count": row.failure_retry_count,
             "token_used": row.token_used,
             "token_budget": row.token_budget,
             "deadline_at": row.deadline_at,
