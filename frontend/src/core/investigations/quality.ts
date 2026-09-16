@@ -174,6 +174,12 @@ export function issueAction(issue: AuditIssue): string {
 }
 
 export function readableError(error: string): string {
+  if (/selected text|report section|current report finding/i.test(error))
+    return "选中的内容与当前报告不一致，请刷新后重新选择一段连续正文。";
+  if (/follow-up limit/i.test(error))
+    return "本次研究的补研次数已用完。如有新的问题，可以新建研究。";
+  if (/another research run|research state changed/i.test(error))
+    return "已有研究正在执行，请等待完成后再提交补研。";
   if (/budget|token|额度|预算/i.test(error))
     return "本次分析额度不足。可以先保存已有结果，或缩小研究范围后重新发起。";
   if (/timeout|deadline|超时/i.test(error))

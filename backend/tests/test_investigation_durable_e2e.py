@@ -100,7 +100,7 @@ class ScriptedBatches:
                             "excerpt": quote,
                             "source_type": "documentation",
                             "language": "en-US",
-                            "dimension": "功能",
+                            "dimension": task.input.get("dimension") or task.input.get("dimensions", ["功能"])[0],
                         }
                         for index in range(1, min(2, len(task.input["search_hits"])) + 1)
                     ]

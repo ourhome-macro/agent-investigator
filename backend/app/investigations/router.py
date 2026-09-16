@@ -10,7 +10,7 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, File, HTTPException, Query, Request, Response, UploadFile, status
 
-from app.investigations.contracts import ApprovalRequest, ClaimCreate, EvidenceCreate, InvestigationCreate, InvestigationStatus, ReworkRequest, ScopePatch
+from app.investigations.contracts import AnnotationRequest, ApprovalRequest, ClaimCreate, EvidenceCreate, InvestigationCreate, InvestigationStatus, ReworkRequest, ScopePatch
 from app.investigations.evidence_validation import sha256_text
 from app.investigations.repository import InvestigationConflict, InvestigationRepository
 from deerflow.runtime.user_context import get_effective_user_id
@@ -71,6 +71,14 @@ async def provider_status(request: Request):
     if service is None:
         raise HTTPException(status_code=503, detail="Competitive Research workflow is not available")
     return service.provider_status
+
+
+@router.get("/options")
+async def investigation_options():
+    from app.investigations.product import research_options
+
+    _user_id()
+    return research_options()
 
 
 @router.get("/{investigation_id}")
@@ -206,6 +214,39 @@ async def list_pricing(investigation_id: str, request: Request):
     result = await _repo(request).list_price_observations(investigation_id, user_id=_user_id())
     if result is None:
         raise _not_found()
+    return result
+
+
+@router.get("/{investigation_id}/evidence/{evidence_id}/snapshot")
+async def evidence_snapshot(investigation_id: str, evidence_id: str, request: Request):
+    result = await _repo(request).evidence_snapshot(investigation_id, evidence_id, user_id=_user_id())
+    if result is None:
+        raise _not_found()
+    return result
+
+
+@router.get("/{investigation_id}/annotations")
+async def list_annotations(investigation_id: str, request: Request):
+    result = await _repo(request).annotations.list(investigation_id, user_id=_user_id())
+    if result is None:
+        raise _not_found()
+    return result
+
+
+@router.post("/{investigation_id}/annotations", status_code=status.HTTP_202_ACCEPTED)
+async def create_annotation(investigation_id: str, body: AnnotationRequest, request: Request):
+    service = getattr(request.app.state, "investigation_workflow_service", None)
+    if service is None or not service.provider_status.get("durable_orchestration"):
+        raise HTTPException(status_code=503, detail="Durable research service is unavailable")
+    user_id = _user_id()
+    try:
+        result = await _repo(request).annotations.create(investigation_id, body, user_id=user_id)
+    except ValueError as exc:
+        raise _conflict(exc) from exc
+    if result is None:
+        raise _not_found()
+    if result["status"] in {"queued", "running"}:
+        service.enqueue(investigation_id, user_id)
     return result
 
 
@@ -352,6 +393,7 @@ async def _start_rework(investigation_id: str, body: ReworkRequest, request: Req
 @router.post("/{investigation_id}/reports/finalize-partial")
 async def finalize_partial_report(investigation_id: str, request: Request):
     from app.investigations.partial_report import build_partial_report
+    from app.investigations.quality import coverage_cells
 
     user_id = _user_id()
     repository = _repo(request)
@@ -364,6 +406,7 @@ async def finalize_partial_report(investigation_id: str, request: Request):
     evidence = await repository.list_evidence(investigation_id, user_id=user_id) or []
     issues = await repository.list_audit_issues(investigation_id, user_id=user_id) or []
     structured, markdown = build_partial_report(investigation, claims, evidence, issues)
+    structured["coverage"] = coverage_cells(await repository.list_competitors(investigation_id, user_id=user_id) or [], investigation["scope"]["dimensions"], claims, issues)
     return await repository.create_report(
         investigation_id,
         structured_data=structured,

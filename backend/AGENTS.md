@@ -471,3 +471,19 @@ levels are separate: `completed_with_gaps` is publishable when core requirements
 are met; absent opportunity hypotheses alone are not failure. Publication must
 re-evaluate the same policy and source-level snapshot. Keep user-visible
 explanations separate from protocol identifiers and original diagnostic errors.
+
+Research product iteration (`ci_0012`): `product.py` owns mode resources and
+decision perspectives. New investigations snapshot their policy; legacy empty
+snapshots retain the prior two-round behavior. Approved competitor-count changes
+reprice the admitted total using the stored policy. Formal execution time starts
+at scope approval. All modes reuse the same confidence and quote gates.
+
+`annotation_repository.py` admits owner-scoped feedback against a specific latest
+report/Claim version and validated text selection. It uses CAS admission plus an
+idempotent request ID, reserves a separately disclosed follow-up allowance, and
+never overwrites the source report. Feedback runs reuse the existing workflow,
+Run and Batch protocol. Analysis and audit stay scoped to the target competitor
+and dimension; `apply_audit_verdicts(claim_ids=...)` must not reset other findings.
+Unresolved feedback remains visible and creates an incomplete result. Request
+completion and the new report are committed together; source_task_id deduplicates
+report creation. Snapshot API reads remain owner- and investigation-scoped.

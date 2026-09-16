@@ -13,10 +13,12 @@ flowchart LR
     C --> D["Normalize and coverage gate"]
     D --> E["Analyze: Durable Batch"]
     E --> F["Audit: DeerFlow Run plus deterministic rules"]
-    F -->|"core issues and round < 2"| G["Rework: Evidence Batch or Claim Revision Run"]
+    F -->|"core issues within mode quota"| G["Rework: Evidence Batch or Claim Revision Run"]
     G --> E
     F -->|"pass or retry exhausted"| H["Synthesis: DeerFlow Run"]
     H --> I["Publish approval"]
+    I -->|"version-bound feedback with new quota"| J["Targeted rework, analysis and audit"]
+    J --> H
 ```
 
 Every executable unit uses the same protocol:
@@ -46,6 +48,9 @@ model class, concurrency, acceptance threshold, and next transition.
 - Analyze creates one Flash-model item per competitor with scoped retrieval.
 - Rework targets blocking issues affecting core requirements and missing
   competitor facts; it can collect evidence or revise/split/retire Claims.
+- A version-bound user annotation enters a separate durable request. Its target
+  takes precedence over the automatic core-gap filter, so optional questions can
+  be explicitly researched without restarting every competitor.
 
 ### Communication
 
@@ -90,6 +95,13 @@ Claim or a core coverage gap without a Claim. Replacement Claims preserve
 retirement history. Collected conflict evidence enters as context until Audit
 determines its relation; re-analysis precedes the next Audit.
 
+For user feedback, analysis and audit are scoped to the target competitor and
+dimension. Audit may update only that Claim set and resolve only matching issues;
+it must not reset other competitors' verified bindings. A gap without a Claim is
+resolved only after the target cell has audited factual coverage. An unanswered
+annotation remains visible and makes the new report incomplete, even if the
+workflow itself finished successfully.
+
 ### Validation
 
 Validation occurs at three gates:
@@ -125,6 +137,27 @@ from eligible Claim versions rather than model-authored factual Markdown.
   submission without asking the model again.
 - Stable workflow, stage, and Batch submission keys prevent duplicate work on
   process restart.
+- Feedback workflow keys include the request ID. Report submissions also retain
+  the source task ID, making report creation replay-safe. The new report and
+  feedback outcome commit in one transaction; old published versions are retained.
+- Owner-scoped feedback admission uses version checks, idempotency and an atomic
+  state update. Cancellation marks the request cancelled in the state transaction,
+  including when execution has not yet started.
+
+## Resource policy
+
+`product.py` owns the versioned resource catalog used by the creation form and
+runtime. Each investigation stores a policy snapshot. Quick, standard and deep
+modes change search/candidate counts, stage caps, total quota, deadline and
+automatic rework rounds (0/1/2); they share one source-aware confidence policy.
+The formal execution deadline starts at scope approval. Older records without a
+snapshot retain their previous two-round policy.
+
+Explicit feedback has a separately disclosed fifteen-minute window and a
+mode-dependent allowance; each investigation accepts at most three requests.
+Outstanding reservations prevent a new request, unused prior quota is discarded,
+and repeated submissions with the same body/key do not allocate more capacity.
+See the [current contract](COMPETITIVE_RESEARCH_V1_SPEC.md) for exact limits.
 
 ## Operational limits and remaining production work
 

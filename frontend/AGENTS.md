@@ -80,6 +80,15 @@ known optional gaps remain distinguishable from interrupted research. The
 creation form allows explicit required dimensions; scope approval shows those
 requirements and approved official domains/repository roots.
 
+Research product components live in `components/workspace/investigations/`:
+comparison views preserve unknown cells and use current eligible findings;
+source navigation validates immutable snapshot hashes and highlights the quoted
+span. Report text selection opens version-bound feedback, with an explicit
+allowance before submission. Reuse the feedback idempotency key on network retry.
+Mode and perspective choices load from `/api/investigations/options`; do not
+duplicate resource policy constants in UI code. Historical reports without
+version/coverage bindings must not be silently treated as valid feedback targets.
+
 ```
 Frontend (Next.js) ──▶ LangGraph SDK ──▶ LangGraph Backend (lead_agent)
                                               ├── Sub-Agents

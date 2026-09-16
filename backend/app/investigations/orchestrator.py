@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import uuid
 from datetime import UTC, datetime
 from typing import Any
@@ -12,6 +11,7 @@ from app.investigations.confidence import is_official_source, issue_is_blocking
 from app.investigations.contracts import AtomicStatement, ClaimCreate, ClaimEvidenceRelation, EvidenceCreate, InvestigationStatus, ResearchScope
 from app.investigations.evidence_validation import locate_verbatim_quote
 from app.investigations.orchestration_repository import OrchestrationRepository
+from app.investigations.product import decision_context, execution_cap, policy_for
 from app.investigations.protocols import DomainSubmission, ReceiptStatus, StageName, StageTask, SubmissionKind
 from app.investigations.providers import ResearchProviderRegistry, canonicalize_url
 from app.investigations.quality import admit_candidate, balance_candidates, candidate_excerpt, claim_is_eligible, coverage_cells, render_grounded_report
@@ -50,6 +50,10 @@ class DurableCompetitiveOrchestrator:
     async def execute(self, workflow: dict[str, Any], *, user_id: str) -> None:
         investigation_id = workflow["investigation_id"]
         investigation = await self._require_investigation(investigation_id, user_id)
+        annotation = await self._investigations.annotations.active(investigation_id, user_id=user_id)
+        if annotation:
+            await self._execute_annotation(workflow, investigation, annotation, user_id=user_id)
+            return
         if investigation["status"] == InvestigationStatus.PLANNING.value:
             await self._plan(workflow, investigation, user_id=user_id)
             return
@@ -93,7 +97,7 @@ class DurableCompetitiveOrchestrator:
                 continue
             if investigation["status"] == InvestigationStatus.AUDITING.value:
                 issues = await self._audit(workflow, investigation, user_id=user_id)
-                if issues and investigation["rework_round"] < 2:
+                if issues and investigation["rework_round"] < policy_for(investigation)["max_rework_rounds"]:
                     await self._investigations.begin_audit_rework(
                         investigation_id,
                         user_id=user_id,
@@ -111,6 +115,43 @@ class DurableCompetitiveOrchestrator:
             if investigation["status"] == InvestigationStatus.SYNTHESIZING.value:
                 await self._synthesize(workflow, investigation, user_id=user_id)
             return
+
+    async def _execute_annotation(self, workflow, investigation, annotation, *, user_id):
+        investigation_id = investigation["id"]
+        question = annotation["payload"]["comment"] + ("\n报告选段：" + annotation["payload"]["selected_text"] if annotation["payload"].get("selected_text") else "")
+        target = {**annotation["target"], "comment": question}
+        await self._investigations.annotations.mark(investigation_id, user_id=user_id, status="running")
+        try:
+            while True:
+                investigation = await self._require_investigation(investigation_id, user_id)
+                if investigation["status"] == "reworking":
+                    await self._rework(workflow, investigation, [], user_id=user_id, annotation=annotation)
+                    await self._investigations.transition(investigation_id, InvestigationStatus.ANALYZING, user_id=user_id, event_type="ci.stage.started")
+                    continue
+                if investigation["status"] == "analyzing":
+                    await self._analyze(workflow, investigation, user_id=user_id, target=target)
+                    await self._investigations.transition(investigation_id, InvestigationStatus.AUDITING, user_id=user_id, event_type="ci.stage.started")
+                    continue
+                if investigation["status"] == "auditing":
+                    await self._audit(workflow, investigation, user_id=user_id, target=target)
+                    if target.get("claim_id") is None:
+                        claims = await self._investigations.list_claims(investigation_id, user_id=user_id) or []
+                        issues = await self._investigations.list_audit_issues(investigation_id, user_id=user_id, status="open") or []
+                        cells = coverage_cells([{"id": target["competitor_id"], "name": "target"}], [target["dimension"]], claims, issues)
+                        await self._investigations.annotations.resolve_gap(investigation_id, user_id=user_id, request_id=annotation["id"], covered=bool(cells and cells[0]["status"] == "covered"))
+                    issues = await self._investigations.list_audit_issues(investigation_id, user_id=user_id, status="open") or []
+                    pending = [issue for issue in issues if issue.get("raised_by") == f"annotation:{annotation['id']}"]
+                    if pending and investigation["rework_round"] < policy_for(investigation)["max_rework_rounds"]:
+                        await self._investigations.begin_audit_rework(investigation_id, user_id=user_id, issue_ids=[issue["id"] for issue in pending])
+                        continue
+                    await self._investigations.transition(investigation_id, InvestigationStatus.SYNTHESIZING, user_id=user_id, event_type="ci.stage.started")
+                    continue
+                if investigation["status"] == "synthesizing":
+                    await self._synthesize(workflow, investigation, user_id=user_id)
+                return
+        except Exception as exc:
+            await self._investigations.annotations.mark(investigation_id, user_id=user_id, status="failed", error=str(exc)[:1000])
+            raise
 
     async def _plan(self, workflow: dict[str, Any], investigation: dict[str, Any], *, user_id: str) -> None:
         task = self._task(
@@ -146,7 +187,14 @@ class DurableCompetitiveOrchestrator:
             return
         try:
             scope = ResearchScope.model_validate(submission.payload.get("scope"))
-            scope = ResearchScope.model_validate({**scope.model_dump(), "required_dimensions": investigation["scope"].get("required_dimensions", [])})
+            scope = ResearchScope.model_validate(
+                {
+                    **scope.model_dump(),
+                    "required_dimensions": investigation["scope"].get("required_dimensions", []),
+                    "perspective": investigation["scope"].get("perspective", "product"),
+                    "decision_goal": investigation["scope"].get("decision_goal", investigation["brief"]),
+                }
+            )
         except ValueError as exc:
             raise StageAcceptanceError(f"Planning returned an invalid research scope: {exc}") from exc
         await self._investigations.complete_planning(investigation["id"], scope, user_id=user_id, run_id=None)
@@ -159,7 +207,7 @@ class DurableCompetitiveOrchestrator:
             *[
                 self._providers.search(
                     f'"{competitor["name"]}" {dimension} {investigation["scope"]["time_range"]}',
-                    max_results=4,
+                    max_results=policy_for(investigation)["search_results"],
                 )
                 for competitor, dimension in queries
             ],
@@ -188,7 +236,7 @@ class DurableCompetitiveOrchestrator:
                         "official_domains": competitor.get("official_domains", []),
                         "official_repositories": competitor.get("official_repositories", []),
                         "dimensions": dimensions,
-                        "search_hits": balance_candidates(hits, dimensions),
+                        "search_hits": balance_candidates(hits, dimensions, limit=policy_for(investigation)["candidate_limit"]),
                         "max_evidence": 10,
                     },
                     acceptance=[
@@ -236,11 +284,14 @@ class DurableCompetitiveOrchestrator:
         if not stage_ok:
             raise StageAcceptanceError("Collection produced no usable evidence or too few valid submissions")
 
-    async def _analyze(self, workflow: dict[str, Any], investigation: dict[str, Any], *, user_id: str) -> None:
+    async def _analyze(self, workflow: dict[str, Any], investigation: dict[str, Any], *, user_id: str, target: dict | None = None) -> None:
         tasks: list[StageTask] = []
         competitors = await self._investigations.list_competitors(investigation["id"], user_id=user_id) or []
         for competitor in competitors:
-            dimension = " / ".join(investigation["scope"]["dimensions"])
+            if target and competitor["id"] != target["competitor_id"]:
+                continue
+            dimensions = [target["dimension"]] if target else investigation["scope"]["dimensions"]
+            dimension = " / ".join(dimensions)
             context = await self._investigations.retrieve_context(
                 investigation["id"],
                 user_id=user_id,
@@ -259,7 +310,9 @@ class DurableCompetitiveOrchestrator:
                         "brief": investigation["brief"],
                         "competitors": investigation["scope"]["competitors"],
                         "dimension": dimension,
-                        "dimensions": investigation["scope"]["dimensions"],
+                        "dimensions": dimensions,
+                        "user_question": (target or {}).get("comment"),
+                        "language": investigation["scope"]["language"],
                         "competitor_id": competitor["id"],
                         "competitor": competitor["name"],
                         "evidence_chunks": context or [],
@@ -288,6 +341,7 @@ class DurableCompetitiveOrchestrator:
                 "include evidence_id, relation, an exact verbatim_quote from evidence_chunks, and snapshot_sha256. "
                 "Pricing claims use claim_type='pricing' and structured observations. Never invent or normalize numbers."
                 " Use claim_type='vendor_statement' for marketing assertions and 'user_report' for individual user feedback. These stay attributed, not general product facts."
+                " Write propositions in the requested language, while keeping every source quote verbatim."
             ),
         )
         submissions, receipts = await self._batches.wait(
@@ -310,9 +364,17 @@ class DurableCompetitiveOrchestrator:
         if not stage_ok:
             raise StageAcceptanceError("Analysis did not reach the 60% item and minimum Claim thresholds")
 
-    async def _audit(self, workflow: dict[str, Any], investigation: dict[str, Any], *, user_id: str) -> list[dict[str, Any]]:
+    async def _audit(self, workflow: dict[str, Any], investigation: dict[str, Any], *, user_id: str, target: dict | None = None) -> list[dict[str, Any]]:
         evidence = await self._investigations.list_evidence(investigation["id"], user_id=user_id) or []
         claims = [claim for claim in await self._investigations.list_claims(investigation["id"], user_id=user_id) or [] if claim["status"] not in {"superseded", "rejected"}]
+        if target:
+            claims = [claim for claim in claims if claim.get("competitor_id") == target["competitor_id"] and claim["dimension"] == target["dimension"]]
+        audited_ids = {claim["id"] for claim in claims}
+        all_findings = await self._investigations.list_claims(investigation["id"], user_id=user_id) or []
+        target_ids = {claim["id"] for claim in all_findings if not target or (claim.get("competitor_id") == target["competitor_id"] and claim["dimension"] == target["dimension"])}
+        open_issues = await self._investigations.list_audit_issues(investigation["id"], user_id=user_id, status="open") or []
+        if target:
+            open_issues = [issue for issue in open_issues if issue.get("claim_id") in target_ids or issue.get("raised_by") == f"annotation:{investigation.get('active_request_id')}"]
         prices = await self._investigations.list_price_observations(investigation["id"], user_id=user_id) or []
         competitor_by_id = {item["id"]: item for item in await self._investigations.list_competitors(investigation["id"], user_id=user_id) or []}
         deterministic = self._deterministic_audit_issues(claims, evidence)
@@ -326,6 +388,7 @@ class DurableCompetitiveOrchestrator:
             input_data={
                 "claims": [self._compact_claim_for_audit(claim) for claim in claims[:200]],
                 "language": investigation["scope"]["language"],
+                "user_question": (target or {}).get("comment"),
                 "retired_claims": [
                     {"id": item["id"], "version": item.get("version", 1), "status": item["status"]}
                     for item in await self._investigations.list_claims(investigation["id"], user_id=user_id) or []
@@ -345,7 +408,7 @@ class DurableCompetitiveOrchestrator:
                 ],
                 "deterministic_issues": deterministic,
                 "price_observations": prices,
-                "open_issues": await self._investigations.list_audit_issues(investigation["id"], user_id=user_id, status="open") or [],
+                "open_issues": open_issues,
             },
             acceptance=[
                 "Never waive a deterministic issue unless the cited evidence directly disproves it.",
@@ -391,12 +454,16 @@ class DurableCompetitiveOrchestrator:
             [item for item in submission.payload.get("binding_verdicts", []) if isinstance(item, dict)],
             user_id=user_id,
             auditor="evidence-auditor",
+            claim_ids=audited_ids,
         )
         claims = await self._investigations.list_claims(investigation["id"], user_id=user_id) or []
         claims = [claim for claim in claims if claim["status"] not in {"superseded", "rejected"}]
+        if target:
+            claims = [claim for claim in claims if claim["id"] in audited_ids]
         deterministic = self._deterministic_audit_issues(claims, evidence)
         deterministic.extend(self._pricing_audit_issues(claims, prices))
-        await self._investigations.resolve_audit_issues(investigation["id"], submission.payload.get("resolutions", []), user_id=user_id)
+        allowed_issue_ids = {issue["id"] for issue in open_issues}
+        await self._investigations.resolve_audit_issues(investigation["id"], [resolution for resolution in submission.payload.get("resolutions", []) if resolution.get("issue_id") in allowed_issue_ids], user_id=user_id)
         issues = list(deterministic)
         known_claim_ids = {claim["id"] for claim in claims}
         atomics = {item.get("claim_id"): item.get("atomic") for item in submission.payload.get("claim_verdicts", []) if isinstance(item, dict)}
@@ -456,6 +523,7 @@ class DurableCompetitiveOrchestrator:
         issues: list[dict[str, Any]],
         *,
         user_id: str,
+        annotation: dict | None = None,
     ) -> None:
         claims = await self._investigations.list_claims(investigation["id"], user_id=user_id) or []
         claim_by_id = {claim["id"]: claim for claim in claims}
@@ -465,13 +533,28 @@ class DurableCompetitiveOrchestrator:
         covered_competitors = {cell["competitor_id"] for cell in cells if cell["status"] == "covered"}
         required_dimensions = set(investigation["scope"].get("required_dimensions", []))
         target_issues = []
+        if annotation:
+            issues = [
+                {
+                    **annotation["target"],
+                    "id": annotation["id"],
+                    "rule": "user_annotation",
+                    "severity": "error",
+                    "reason": annotation["payload"]["comment"],
+                    "required_action": annotation["payload"]["action"],
+                    "research_question": annotation["payload"]["comment"],
+                }
+            ]
         for issue in issues:
             if not issue_is_blocking(issue):
                 continue
             claim = claim_by_id.get(issue.get("claim_id"))
+            if annotation and claim is None and issue.get("competitor_id"):
+                target_issues.append(issue)
+                continue
             if claim is None or claim["status"] in {"superseded", "rejected"}:
                 continue
-            if claim.get("competitor_id") in covered_competitors and claim["dimension"] not in required_dimensions:
+            if not annotation and claim.get("competitor_id") in covered_competitors and claim["dimension"] not in required_dimensions:
                 continue
             action = issue.get("required_action")
             if action in {"revise", "split", "reject"}:
@@ -481,7 +564,7 @@ class DurableCompetitiveOrchestrator:
         target_issues.extend(
             {"id": f"gap-{index}", "claim_id": None, "competitor_id": cell["competitor_id"], "dimension": cell["dimension"], "rule": "coverage_gap", "reason": "Missing verified coverage", "required_action": "recollect"}
             for index, cell in enumerate(cells)
-            if cell["status"] == "missing" and (cell["competitor_id"] not in covered_competitors or cell["dimension"] in required_dimensions)
+            if not annotation and cell["status"] == "missing" and (cell["competitor_id"] not in covered_competitors or cell["dimension"] in required_dimensions)
         )
         unique = {}
         for issue in target_issues:
@@ -492,8 +575,10 @@ class DurableCompetitiveOrchestrator:
             *[
                 self._providers.search(
                     f'"{competitor_by_id[issue["competitor_id"]]["name"]}" {issue["dimension"]} {investigation["scope"]["time_range"]} official documentation'
-                    + (" limitations changes version differences 不支持 限制 版本差异" if issue["required_action"] == "investigate_conflict" else ""),
-                    max_results=6,
+                    + (" limitations changes version differences 不支持 限制 版本差异" if issue["required_action"] == "investigate_conflict" else "")
+                    + (" " + str(issue.get("research_question", ""))[:180]),
+                    # The user question is data, scoped to the selected product/question.
+                    max_results=policy_for(investigation)["search_results"] + 2,
                 )
                 for issue in target_issues
             ],
@@ -523,6 +608,7 @@ class DurableCompetitiveOrchestrator:
                         "claim": claim_by_id.get(issue.get("claim_id")),
                         "audit_rule": issue["rule"],
                         "audit_reason": issue["reason"],
+                        "user_question": issue.get("research_question"),
                         "required_action": issue["required_action"],
                         "evidence_relation": "context" if issue["required_action"] == "investigate_conflict" else "supports",
                         "search_hits": hits,
@@ -603,6 +689,10 @@ class DurableCompetitiveOrchestrator:
         claims = await self._investigations.list_claims(investigation["id"], user_id=user_id) or []
         evidence = await self._investigations.list_evidence(investigation["id"], user_id=user_id) or []
         issues = await self._investigations.list_audit_issues(investigation["id"], user_id=user_id, status="open") or []
+        annotation = await self._investigations.annotations.active(investigation["id"], user_id=user_id)
+        if annotation:
+            unresolved = any(issue.get("raised_by") == f"annotation:{annotation['id']}" for issue in issues)
+            investigation = {**investigation, "annotation_unresolved": unresolved, "annotation": annotation}
         prices = await self._investigations.list_price_observations(investigation["id"], user_id=user_id) or []
         claims = [claim for claim in claims if claim_is_eligible(claim, issues)]
         competitors = await self._investigations.list_competitors(investigation["id"], user_id=user_id) or []
@@ -614,6 +704,8 @@ class DurableCompetitiveOrchestrator:
             role="report-editor",
             input_data={
                 "title": investigation["title"],
+                "decision": decision_context(investigation["scope"]),
+                "annotation": annotation,
                 "scope": investigation["scope"],
                 "claims": [
                     {
@@ -646,11 +738,13 @@ class DurableCompetitiveOrchestrator:
             instruction=(
                 "Act as the Report Editor. Return kind='report' with payload.sections. Each section has type and claim_ids only. The server renders facts and the comparison matrix. "
                 "For opportunities optionally add hypotheses with hypothesis, premise_claim_ids and validation. Hypotheses must be explicit proposals, never new factual assertions. Do not return markdown."
+                " Prioritize the user's decision.goal and decision.question. Product planning needs priorities, purchase needs selection checks, sales needs defensible differences, operations needs user experiments."
             ),
         )
         if submission is None:
             return
         structured, markdown = render_grounded_report(investigation, submission.payload["sections"], claims, evidence, issues, competitors)
+        structured["source_task_id"] = task.task_id
         await self._investigations.create_report(investigation["id"], structured_data=structured, rendered_markdown=markdown, user_id=user_id)
 
     async def _execute_run_task(
@@ -726,12 +820,7 @@ class DurableCompetitiveOrchestrator:
                 raise StageAcceptanceError(receipt.error or f"{task.stage.value} run did not return an accepted submission")
 
     async def _assert_budget(self, investigation: dict[str, Any], tasks: list[StageTask], *, user_id: str) -> None:
-        if tasks[0].stage in {StageName.COLLECTING, StageName.REWORKING}:
-            estimated = 35_000 * len(tasks)
-        elif tasks[0].stage == StageName.ANALYZING:
-            estimated = 30_000 * len(tasks)
-        else:
-            estimated = sum(max(3000, len(json.dumps(task.input, ensure_ascii=False, default=str)) // 2 + 4000) for task in tasks)
+        estimated = sum(execution_cap(investigation, task.stage.value) for task in tasks)
         await self._investigations.assert_execution_budget(
             investigation["id"],
             user_id=user_id,
@@ -753,7 +842,7 @@ class DurableCompetitiveOrchestrator:
                 raise StageAcceptanceError("Persisted stage envelope does not match scheduled tasks")
             for task in tasks:
                 task.input = persisted_tasks[task.task_id].input
-            cap = 30_000 if tasks[0].stage == StageName.ANALYZING else 35_000
+            cap = execution_cap(investigation, tasks[0].stage.value)
             await self._investigations.reserve_budget(investigation["id"], user_id=user_id, stage=tasks[0].stage.value, reservation_key=stage_attempt_id, tokens=cap * len(tasks))
             for task in tasks:
                 task.input["execution_token_cap"] = cap
@@ -772,8 +861,9 @@ class DurableCompetitiveOrchestrator:
         stage_attempt_id: str,
     ) -> None:
         actual_total = 0
+        investigation = await self._require_investigation(investigation_id, user_id)
         for receipt in receipts:
-            cap = 30_000 if receipt.stage == StageName.ANALYZING else 35_000
+            cap = execution_cap(investigation, receipt.stage.value)
             usage = receipt.token_usage or {"total_tokens": cap, "estimated": True}
             actual_total += int(usage.get("total_tokens") or usage.get("input_tokens", 0) + usage.get("output_tokens", 0))
             execution_id = receipt.run_id or receipt.durable_batch_item_id or receipt.task_id
@@ -1079,6 +1169,7 @@ class DurableCompetitiveOrchestrator:
                             competitor_id=task.input.get("competitor_id") if task else candidate.get("competitor_id"),
                             dimension=dimension,
                             text=statement.render(),
+                            statement=statement,
                             material=True,  # Full text stays mandatory; source-aware policy decides sufficiency.
                             claim_type=str(candidate.get("claim_type") or "fact"),
                             evidence_bindings=candidate.get("evidence_bindings", []),

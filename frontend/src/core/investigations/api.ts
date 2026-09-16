@@ -10,6 +10,11 @@ import type {
   Report,
   ResearchScope,
   StageItem,
+  ResearchMode,
+  ResearchOptions,
+  EvidenceSnapshot,
+  AnnotationInput,
+  ResearchAnnotation,
 } from "./types";
 
 async function json<T>(response: Response): Promise<T> {
@@ -34,6 +39,7 @@ export async function createInvestigation(input: {
   title: string;
   brief: string;
   scope: ResearchScope;
+  mode?: ResearchMode;
 }): Promise<Investigation> {
   return json(
     await fetch("/api/investigations", {
@@ -43,6 +49,44 @@ export async function createInvestigation(input: {
         investigation_type: "competitive_research",
         ...input,
       }),
+    }),
+  );
+}
+
+export async function getResearchOptions(): Promise<ResearchOptions> {
+  return json(await fetch("/api/investigations/options"));
+}
+
+export async function getEvidenceSnapshot(
+  id: string,
+  evidenceId: string,
+  signal?: AbortSignal,
+): Promise<EvidenceSnapshot> {
+  return json(
+    await fetch(
+      `/api/investigations/${encodeURIComponent(id)}/evidence/${encodeURIComponent(evidenceId)}/snapshot`,
+      { signal },
+    ),
+  );
+}
+
+export async function listAnnotations(
+  id: string,
+): Promise<ResearchAnnotation[]> {
+  return json(
+    await fetch(`/api/investigations/${encodeURIComponent(id)}/annotations`),
+  );
+}
+
+export async function submitAnnotation(
+  id: string,
+  body: AnnotationInput,
+): Promise<ResearchAnnotation> {
+  return json(
+    await fetch(`/api/investigations/${encodeURIComponent(id)}/annotations`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
     }),
   );
 }

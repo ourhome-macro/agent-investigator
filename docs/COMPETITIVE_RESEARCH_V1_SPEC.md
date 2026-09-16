@@ -12,6 +12,8 @@ Historical implementation notes are indexed in [docs/README.md](README.md).
 - Explicit `required_dimensions` must be a subset of the comparison dimensions.
   Other gaps may remain documented without making the whole report incomplete.
 - Scope approval precedes collection; report approval precedes publication.
+- Scope records the decision goal and a product, purchasing, sales or operations
+  perspective. Perspective changes report questions, not evidence standards.
 - Official domains and repository roots are shown at scope approval.
   A shared hosting domain such as github.com does not establish repository
   ownership; Issue, forum and user-content pages do not become official product
@@ -30,8 +32,8 @@ Application code owns stage transitions:
 auditing → reworking (when required) → synthesizing →
 awaiting_publish_approval → published`.
 
-Failures and cancellation have explicit terminal states. Business rework is
-bounded to two rounds. Optional gaps and non-blocking notes do not cause
+Failures and cancellation have explicit terminal states. Automatic business
+rework is bounded by the saved mode policy (zero, one or two rounds). Optional gaps and non-blocking notes do not cause
 unnecessary automatic rework; missing competitor facts and required dimensions do.
 
 ## Evidence and claims
@@ -93,11 +95,47 @@ results rather than duplicating all Claims across report chapters.
 Publication rechecks Claim versions, source-basis snapshots and current core
 requirements. Web, Markdown and server-rendered PDF preserve attribution.
 
+The workspace provides separate capability/conditions, pricing and user/scenario
+views. Cells without evidence remain unknown; raw unverified prices are not
+displayed as confirmed offers. Quote navigation opens the saved full-text
+snapshot, checks its hash against the binding and highlights the cited passage.
+
+## Version-bound feedback
+
+Feedback binds a report version, section, optional selected passage and current
+Claim version, or an unresolved competitor/dimension cell. The server validates
+ownership, section membership, selection, scope and an idempotency key.
+
+Accepted feedback becomes a durable `ci_research_requests` record and an audit
+issue. The existing workflow recollects or revises, analyzes and audits only the
+target product/question. Unrelated Claim bindings are not reset. A new report
+version is created for human review; the prior report remains unchanged.
+Unresolved feedback is marked `needs_review` and cannot produce a fully complete
+report. Cancellation updates the request in the same state transaction.
+
+Each investigation permits at most three explicitly requested follow-ups. Each
+has a fresh fifteen-minute execution window and an additional mode-dependent
+allowance (100K, 150K or 220K tokens), disclosed before submission. Unused earlier
+allowance is not carried forward. A pending token reservation blocks admission;
+duplicate requests do not add budget. Result-report creation and request
+completion are committed together.
+
 ## Budgets and recovery
 
-Investigations have a thirty-minute deadline and a 300K–525K token budget scaled
-by competitor count. Stages reserve capacity before dispatch. Non-audit/report
-stages leave twenty percent of capacity for completion work.
+New investigations snapshot the resource policy selected at creation:
+
+| Mode | Token ceiling for 2–5 competitors | Execution window | Automatic rework rounds |
+| --- | --- | --- | --- |
+| Quick | 180K–270K | 15 minutes | 0 |
+| Standard | 300K–525K | 30 minutes | 1 |
+| Deep | 450K–750K | 45 minutes | 2 |
+
+Modes also change search result counts, candidate limits and per-stage execution
+caps, never truth or quotation requirements. Scope edits reprice the total using
+the saved competitor-count formula. The formal execution window starts at scope
+approval. Legacy investigations without a policy snapshot retain two rework
+rounds. Stages reserve capacity before dispatch; non-audit/report stages leave
+twenty percent of capacity for completion work.
 
 Text request preflight conservatively bounds input and caps output before a
 model call. Unknown usage remains charged or reserved. Research batches use one
@@ -111,8 +149,10 @@ for lease and replay semantics.
 ## Storage, deployment and verification
 
 The independent migration chain is `alembic_version_ci`, currently through
-`ci_0011`. `ci_0010` adds candidates, budget reservations and submission aliases;
-`ci_0011` adds source basis, approved repositories and required dimensions.
+`ci_0012`. `ci_0010` adds candidates, budget reservations and submission aliases;
+`ci_0011` adds source basis, approved repositories and required dimensions;
+`ci_0012` adds mode snapshots, decision context, atomic statements and feedback
+requests without rewriting historical report contents.
 
 Development can use SQLite, local artifacts and development providers.
 Production requires PostgreSQL, DB Run Events, Redis StreamBridge, durable
@@ -123,5 +163,5 @@ alongside the existing stack.
 
 These implementations do not substitute for a live production acceptance run.
 Current offline results and limitations are recorded in
-[source policy and workspace validation](COMPETITIVE_RESEARCH_CONFIDENCE_AND_WORKSPACE_ZH.md).
+[product iteration validation](RESEARCH_PRODUCT_ITERATION_2026-09-16_ZH.md).
 The historical Bilibili run did not complete Audit.

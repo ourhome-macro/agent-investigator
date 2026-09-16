@@ -5,7 +5,16 @@ import { useParams } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
-import { MarkdownContent } from "@/components/workspace/messages/markdown-content";
+import {
+  AnnotationDialog,
+  type FeedbackTarget,
+} from "@/components/workspace/investigations/annotation-dialog";
+import { ComparisonViews } from "@/components/workspace/investigations/comparison-views";
+import { ReportReview } from "@/components/workspace/investigations/report-review";
+import {
+  SourceDialog,
+  type SourceSelection,
+} from "@/components/workspace/investigations/source-dialog";
 import {
   approveReport,
   approveScope,
@@ -18,6 +27,7 @@ import {
   listEvidence,
   listPricing,
   listStageItems,
+  listAnnotations,
   rejectReport,
   retryInvestigation,
   uploadMaterial,
@@ -29,6 +39,7 @@ import {
   type PriceObservation,
   type Report,
   type StageItem,
+  type ResearchAnnotation,
 } from "@/core/investigations";
 import {
   claimDisplayStatus,
@@ -43,7 +54,6 @@ import {
   issueExplanation,
   issueAction,
   readableError,
-  billingLabel,
   shouldPollInvestigation,
 } from "@/core/investigations/quality";
 
@@ -60,6 +70,12 @@ export default function InvestigationPage() {
   const [stageItems, setStageItems] = useState<StageItem[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [coverage, setCoverage] = useState<CoverageCell[]>([]);
+  const [annotations, setAnnotations] = useState<ResearchAnnotation[]>([]);
+  const [sourceSelection, setSourceSelection] =
+    useState<SourceSelection | null>(null);
+  const [feedbackTarget, setFeedbackTarget] = useState<FeedbackTarget | null>(
+    null,
+  );
   const loadSequence = useRef(0);
   const loadingId = useRef<string | null>(null);
   const load = useCallback(async () => {
@@ -76,6 +92,7 @@ export default function InvestigationPage() {
         nextReport,
         nextStageItems,
         nextCoverage,
+        nextAnnotations,
       ] = await Promise.all([
         listEvidence(id),
         listClaims(id),
@@ -84,10 +101,12 @@ export default function InvestigationPage() {
         getLatestReport(id),
         listStageItems(id),
         getCoverage(id),
+        listAnnotations(id),
       ]);
       if (sequence !== loadSequence.current) return;
       setInvestigation(current);
       setCoverage(nextCoverage);
+      setAnnotations(nextAnnotations);
       setEvidence(nextEvidence);
       setClaims(nextClaims);
       setAuditIssues(nextAuditIssues);
@@ -131,6 +150,57 @@ export default function InvestigationPage() {
         )}
       </main>
     );
+  const policy = investigation.resource_policy ?? investigation.policy_snapshot;
+  const canRefine =
+    !!report &&
+    ["awaiting_publish_approval", "published"].includes(investigation.status) &&
+    !!policy &&
+    annotations.length < policy.max_annotations &&
+    !investigation.active_request_id;
+  const openRefinement = (target: Claim | CoverageCell) => {
+    if (!report || !canRefine) return;
+    if ("id" in target) {
+      const section = report.structured_data?.sections?.find((item) =>
+        item.claim_ids.includes(target.id),
+      );
+      if (
+        !section ||
+        report.structured_data?.claim_versions?.[target.id] === undefined
+      ) {
+        setError("当前报告没有这条结论的可定位版本，请先生成新报告。");
+        return;
+      }
+      setFeedbackTarget({
+        sectionKey: section.type,
+        quote: (target.display_text ?? target.text).slice(0, 4000),
+        claims: [target],
+      });
+    } else {
+      const sectionKey = report.structured_data?.sections?.some(
+        (item) => item.type === "feature_matrix",
+      )
+        ? "feature_matrix"
+        : "risks_unknowns";
+      if (
+        !report.structured_data?.coverage?.some(
+          (item) =>
+            item.competitor_id === target.competitor_id &&
+            item.dimension === target.dimension,
+        )
+      ) {
+        setError(
+          "这份历史报告没有可定位的覆盖记录，请先继续原研究或新建研究。",
+        );
+        return;
+      }
+      setFeedbackTarget({
+        sectionKey,
+        quote: "",
+        claims: [],
+        cell: target,
+      });
+    }
+  };
   return (
     <main className="mx-auto w-full max-w-7xl space-y-8 p-6 md:p-10">
       <header className="flex flex-wrap items-start justify-between gap-4">
@@ -144,6 +214,12 @@ export default function InvestigationPage() {
           </p>
           <p className="mt-3 max-w-3xl text-sm">
             {researchNextStep(investigation.status)}
+          </p>
+          <p className="text-muted-foreground mt-2 text-sm">
+            {policy?.label ?? "常规研究"} · 决策目标：
+            {investigation.scope.decision_goal?.trim()
+              ? investigation.scope.decision_goal
+              : investigation.brief}
           </p>
         </div>
         <div className="flex gap-2">
@@ -191,6 +267,18 @@ export default function InvestigationPage() {
       {investigation.status === "awaiting_scope_approval" && (
         <section className="border-primary/40 rounded-xl border p-6">
           <h2 className="text-xl font-medium">确认要研究什么</h2>
+          {policy && (
+            <p className="text-muted-foreground mt-2 text-sm">
+              {policy.label}：初始分析额度 {policy.token_budget / 10000} 万
+              Token，确认范围后执行时间上限 {policy.minutes} 分钟。
+            </p>
+          )}
+          <p className="mt-3">
+            这次要决定：
+            {investigation.scope.decision_goal?.trim()
+              ? investigation.scope.decision_goal
+              : investigation.brief}
+          </p>
           <p className="mt-3">
             竞品：{investigation.scope.competitors.join("、")}
           </p>
@@ -354,97 +442,164 @@ export default function InvestigationPage() {
           )}
         </div>
       </section>
-      <section className="space-y-3">
-        <h2 className="text-xl font-medium">哪些问题已有依据</h2>
-        <p className="text-muted-foreground text-sm">
-          “缺少资料”表示暂时没有足够信息，不代表产品没有这项能力。部分问题仍未知时，研究也可以完成并注明缺口。
-        </p>
-        <div className="overflow-x-auto rounded-lg border">
-          <table className="w-full text-left text-sm">
-            <thead>
-              <tr>
-                <th className="p-3">竞品</th>
-                <th className="p-3">研究问题</th>
-                <th className="p-3">状态</th>
-              </tr>
-            </thead>
-            <tbody>
-              {coverage.map((cell) => (
-                <tr
-                  className="border-t"
-                  key={`${cell.competitor_id}:${cell.dimension}`}
-                >
-                  <td className="p-3">{cell.competitor}</td>
-                  <td className="p-3">{cell.dimension}</td>
-                  <td className="p-3">
-                    {cell.status === "covered"
-                      ? "已有产品事实依据"
-                      : cell.status === "partial"
-                        ? "有线索，仍需核实"
-                        : "缺少资料"}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-        <h2 className="text-xl font-medium">研究结论与依据</h2>
-        {claims.map((claim) => (
-          <article key={claim.id} className="rounded-lg border p-4">
-            <div className="flex justify-between gap-3">
-              <span className="text-sm font-medium">{claim.dimension}</span>
-              <span
-                className={
-                  claim.publication_eligible === true &&
-                  !["vendor_stated", "user_reported"].includes(
-                    claim.support_basis ?? "",
-                  )
-                    ? "text-emerald-600"
-                    : "text-amber-600"
-                }
-              >
-                {claimDisplayStatus(claim)}
-              </span>
-            </div>
-            <p className="mt-2">{claim.display_text ?? claim.text}</p>
-            <p className="text-muted-foreground mt-2 text-sm">
-              {claimStatusExplanation(claim)}
-            </p>
-            <p className="text-muted-foreground mt-2 text-xs">
-              来自 {claim.independent_source_count} 个来源域名，关联{" "}
-              {claim.evidence_ids.length} 份资料。来源数量本身不等于可信度。
-            </p>
-            <div className="mt-3 space-y-2">
-              {claim.evidence_bindings.map((binding) => (
-                <blockquote
-                  key={`${binding.evidence_id}:${binding.relation}`}
-                  className="border-l-2 pl-3 text-sm"
-                >
-                  <p>“{binding.verbatim_quote}”</p>
-                  <p className="text-muted-foreground mt-1 text-xs">
-                    {bindingLabel(binding.relation)} ·{" "}
-                    {bindingLabel(binding.validation_status)} ·{" "}
-                    {bindingLabel(binding.entailment_status)}
-                  </p>
-                  {evidence.find((item) => item.id === binding.evidence_id) && (
-                    <a
-                      className="text-primary mt-1 inline-block text-xs"
-                      href={
-                        evidence.find((item) => item.id === binding.evidence_id)
-                          ?.source_url
-                      }
-                      target="_blank"
-                      rel="noreferrer"
-                    >
-                      查看原文 ↗
-                    </a>
-                  )}
+      <ComparisonViews
+        investigation={investigation}
+        claims={claims}
+        coverage={coverage}
+        pricing={pricing}
+        evidence={evidence}
+        onSource={setSourceSelection}
+        onRefine={openRefinement}
+        canRefine={canRefine}
+      />
+      {annotations.length > 0 && (
+        <section className="space-y-3 rounded-xl border p-5">
+          <h2 className="text-xl font-medium">你的批注与补研进展</h2>
+          {annotations.map((item) => (
+            <article className="border-t pt-3 text-sm" key={item.id}>
+              <div className="flex justify-between gap-3">
+                <p>
+                  针对第 {item.payload.report_version} 版 ·{" "}
+                  {item.target.dimension}
+                </p>
+                <span>
+                  {
+                    {
+                      queued: "已排队",
+                      running: "正在补充研究",
+                      completed: "已生成新报告，等待你确认",
+                      needs_review: "仍有问题需要确认",
+                      failed: "本次补研未完成",
+                      cancelled: "已停止",
+                    }[item.status]
+                  }
+                </span>
+              </div>
+              {item.payload.selected_text && (
+                <blockquote className="text-muted-foreground mt-2 border-l-2 pl-3">
+                  {item.payload.selected_text}
                 </blockquote>
-              ))}
-            </div>
-          </article>
-        ))}
-      </section>
+              )}
+              <p className="mt-2">你的要求：{item.payload.comment}</p>
+              {item.error && (
+                <p className="text-destructive mt-2">
+                  {readableError(item.error)}
+                </p>
+              )}
+            </article>
+          ))}
+        </section>
+      )}
+      <details className="rounded-xl border p-5">
+        <summary className="cursor-pointer font-medium">
+          核查明细：覆盖情况与全部结论
+        </summary>
+        <section className="space-y-3">
+          <h2 className="text-xl font-medium">哪些问题已有依据</h2>
+          <p className="text-muted-foreground text-sm">
+            “缺少资料”表示暂时没有足够信息，不代表产品没有这项能力。部分问题仍未知时，研究也可以完成并注明缺口。
+          </p>
+          <div className="overflow-x-auto rounded-lg border">
+            <table className="w-full text-left text-sm">
+              <thead>
+                <tr>
+                  <th className="p-3">竞品</th>
+                  <th className="p-3">研究问题</th>
+                  <th className="p-3">状态</th>
+                </tr>
+              </thead>
+              <tbody>
+                {coverage.map((cell) => (
+                  <tr
+                    className="border-t"
+                    key={`${cell.competitor_id}:${cell.dimension}`}
+                  >
+                    <td className="p-3">{cell.competitor}</td>
+                    <td className="p-3">{cell.dimension}</td>
+                    <td className="p-3">
+                      {cell.status === "covered"
+                        ? "已有产品事实依据"
+                        : cell.status === "partial"
+                          ? "有线索，仍需核实"
+                          : "缺少资料"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <h2 className="text-xl font-medium">研究结论与依据</h2>
+          {claims.map((claim) => (
+            <article key={claim.id} className="rounded-lg border p-4">
+              <div className="flex justify-between gap-3">
+                <span className="text-sm font-medium">{claim.dimension}</span>
+                <span
+                  className={
+                    claim.publication_eligible === true &&
+                    !["vendor_stated", "user_reported"].includes(
+                      claim.support_basis ?? "",
+                    )
+                      ? "text-emerald-600"
+                      : "text-amber-600"
+                  }
+                >
+                  {claimDisplayStatus(claim)}
+                </span>
+              </div>
+              <p className="mt-2">{claim.display_text ?? claim.text}</p>
+              <p className="text-muted-foreground mt-2 text-sm">
+                {claimStatusExplanation(claim)}
+              </p>
+              <p className="text-muted-foreground mt-2 text-xs">
+                来自 {claim.independent_source_count} 个来源域名，关联{" "}
+                {claim.evidence_ids.length} 份资料。来源数量本身不等于可信度。
+              </p>
+              <div className="mt-3 space-y-2">
+                {claim.evidence_bindings.map((binding) => (
+                  <blockquote
+                    key={`${binding.evidence_id}:${binding.relation}`}
+                    className="border-l-2 pl-3 text-sm"
+                  >
+                    <p>“{binding.verbatim_quote}”</p>
+                    <p className="text-muted-foreground mt-1 text-xs">
+                      {bindingLabel(binding.relation)} ·{" "}
+                      {bindingLabel(binding.validation_status)} ·{" "}
+                      {bindingLabel(binding.entailment_status)}
+                    </p>
+                    <button
+                      className="text-primary mr-3 text-xs underline"
+                      onClick={() =>
+                        setSourceSelection({
+                          evidenceId: binding.evidence_id,
+                          binding,
+                        })
+                      }
+                    >
+                      查看保存原文与引用位置
+                    </button>
+                    {evidence.find(
+                      (item) => item.id === binding.evidence_id,
+                    ) && (
+                      <a
+                        className="text-primary mt-1 inline-block text-xs"
+                        href={
+                          evidence.find(
+                            (item) => item.id === binding.evidence_id,
+                          )?.source_url
+                        }
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        查看原文 ↗
+                      </a>
+                    )}
+                  </blockquote>
+                ))}
+              </div>
+            </article>
+          ))}
+        </section>
+      </details>
       {auditIssues.length > 0 && (
         <section className="space-y-3">
           <h2 className="text-xl font-medium">待处理问题与补充说明</h2>
@@ -479,39 +634,6 @@ export default function InvestigationPage() {
               </details>
             </article>
           ))}
-        </section>
-      )}
-      {pricing.length > 0 && (
-        <section className="space-y-3">
-          <h2 className="text-xl font-medium">价格与收费方式</h2>
-          <div className="overflow-x-auto rounded-xl border">
-            <table className="w-full text-left text-sm">
-              <thead className="bg-muted">
-                <tr>
-                  <th className="p-3">套餐</th>
-                  <th className="p-3">价格</th>
-                  <th className="p-3">周期</th>
-                  <th className="p-3">单位</th>
-                  <th className="p-3">来源</th>
-                </tr>
-              </thead>
-              <tbody>
-                {pricing.map((item) => (
-                  <tr key={item.id} className="border-t">
-                    <td className="p-3">{item.plan_name}</td>
-                    <td className="p-3">
-                      {item.currency} {item.amount}
-                    </td>
-                    <td className="p-3">{billingLabel(item.billing_period)}</td>
-                    <td className="p-3">{billingLabel(item.billing_unit)}</td>
-                    <td className="p-3">
-                      {item.official ? "官方" : "第三方估计"}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
         </section>
       )}
       <section className="space-y-3">
@@ -576,6 +698,16 @@ export default function InvestigationPage() {
                 <>
                   <Button
                     variant="destructive"
+                    disabled={
+                      !!policy &&
+                      investigation.rework_round >= policy.max_rework_rounds
+                    }
+                    title={
+                      policy &&
+                      investigation.rework_round >= policy.max_rework_rounds
+                        ? "整体返工额度已用完，可针对具体结论发起补研。"
+                        : undefined
+                    }
                     onClick={() => {
                       const reason = window.prompt("请输入返工原因");
                       if (reason)
@@ -601,12 +733,28 @@ export default function InvestigationPage() {
               )}
             </div>
           </div>
-          <MarkdownContent
-            className="mt-5"
-            content={report.rendered_markdown}
-            isLoading={false}
+          <ReportReview
+            report={report}
+            claims={claims}
+            canRefine={canRefine}
+            onRefine={setFeedbackTarget}
           />
         </section>
+      )}
+      <SourceDialog
+        investigationId={id}
+        selection={sourceSelection}
+        onClose={() => setSourceSelection(null)}
+      />
+      {feedbackTarget && report && (
+        <AnnotationDialog
+          key={`${report.version}:${feedbackTarget.sectionKey}:${feedbackTarget.quote}`}
+          investigation={investigation}
+          report={report}
+          target={feedbackTarget}
+          onClose={() => setFeedbackTarget(null)}
+          onSubmitted={load}
+        />
       )}
     </main>
   );

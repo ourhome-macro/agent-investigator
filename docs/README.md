@@ -20,6 +20,7 @@
 | [竞品研究规格](COMPETITIVE_RESEARCH_V1_SPEC.md) | 产品范围、证据约束、完成条件、预算与迁移 |
 | [编排与恢复](COMPETITIVE_RESEARCH_MULTI_AGENT_ORCHESTRATION.md) | 阶段执行、审计动作、提交协议和恢复 |
 | [来源分级与工作台](COMPETITIVE_RESEARCH_CONFIDENCE_AND_WORKSPACE_ZH.md) | 官方单来源、厂商自述、用户反馈、必答项目与界面解释 |
+| [业务视角、对比视图与批注补研](RESEARCH_PRODUCT_ITERATION_2026-09-16_ZH.md) | 当前研究档位、决策目标、原文定位与定向补研 |
 | [总体架构](ARCHITECTURE.md) | DeerFlow 全栈与运行时背景；研究子系统以以上文档为准 |
 | [根目录开发约定](../AGENTS.md) | 仓库地图与跨模块规则 |
 | [后端约定](../backend/AGENTS.md) / [前端约定](../frontend/AGENTS.md) | 模块结构、测试与开发规范 |

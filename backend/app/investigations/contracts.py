@@ -72,6 +72,8 @@ class ResearchScope(BaseModel):
     official_domains: dict[str, list[str]] = Field(default_factory=dict)
     official_repositories: dict[str, list[str]] = Field(default_factory=dict)
     required_dimensions: list[str] = Field(default_factory=list, max_length=12)
+    perspective: Literal["product", "purchase", "sales", "operations"] = "product"
+    decision_goal: str = Field(default="", max_length=1500)
 
     @field_validator("competitors", "dimensions")
     @classmethod
@@ -140,6 +142,7 @@ class InvestigationCreate(BaseModel):
     brief: str = Field(min_length=10, max_length=10_000)
     project_id: str | None = Field(default=None, max_length=64)
     scope: ResearchScope
+    mode: Literal["quick", "standard", "deep"] = "standard"
 
 
 class InvestigationSummary(BaseModel):
@@ -173,6 +176,36 @@ class ApprovalRequest(BaseModel):
 class ReworkRequest(BaseModel):
     reason: str = Field(min_length=3, max_length=5000)
     idempotency_key: str = Field(min_length=8, max_length=128)
+
+
+class AnnotationRequest(BaseModel):
+    report_version: int = Field(ge=1)
+    section_key: str = Field(min_length=1, max_length=64)
+    selected_text: str = Field(default="", max_length=4000)
+    comment: str = Field(min_length=5, max_length=3000)
+    action: Literal["recollect", "revise", "investigate_conflict"] = "recollect"
+    claim_id: str | None = None
+    claim_version: int | None = Field(default=None, ge=1)
+    competitor_id: str | None = None
+    dimension: str | None = None
+    idempotency_key: str = Field(min_length=8, max_length=128)
+
+    @field_validator("comment")
+    @classmethod
+    def meaningful_comment(cls, value: str) -> str:
+        value = value.strip()
+        if len(value) < 5:
+            raise ValueError("Feedback must describe a concrete research question")
+        return value
+
+    @model_validator(mode="after")
+    def require_target(self):
+        if self.claim_id:
+            if self.claim_version is None or self.competitor_id or self.dimension:
+                raise ValueError("Claim feedback requires its version and cannot mix another target")
+        elif not self.competitor_id or not self.dimension or self.claim_version is not None or self.action != "recollect":
+            raise ValueError("Gap feedback requires a competitor and dimension with recollect action")
+        return self
 
 
 class EvidenceCreate(BaseModel):
@@ -262,9 +295,12 @@ class ClaimCreate(BaseModel):
     evidence_ids: list[str] = Field(default_factory=list)
     evidence_bindings: list[ClaimEvidenceBinding] = Field(default_factory=list, max_length=20)
     price_observations: list[PriceObservationCreate] = Field(default_factory=list, max_length=20)
+    statement: AtomicStatement | None = None
 
     @model_validator(mode="after")
     def require_verbatim_evidence_bindings(self) -> ClaimCreate:
+        if self.statement is not None and " ".join(self.statement.render().split()) != " ".join(self.text.split()):
+            raise ValueError("Atomic statement and conditions must match the audited Claim text")
         binding_ids = [binding.evidence_id for binding in self.evidence_bindings]
         if len(binding_ids) != len(set(binding_ids)):
             raise ValueError("Claim evidence bindings must reference unique Evidence IDs")

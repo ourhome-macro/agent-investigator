@@ -113,7 +113,7 @@ def completion_state(investigation: dict, cells: list[dict], claims: list[dict],
     interrupted = investigation.get("status") in {"failed", "cancelled", "cancelling"}
     report_blocked = any(issue_is_blocking(issue) and issue.get("claim_id") is None for issue in issues)
     missing_core = any(cell["competitor_id"] not in covered_competitors or (cell["dimension"] in required_dimensions and cell["status"] != "covered") for cell in cells)
-    if interrupted or report_blocked or missing_core or not factual:
+    if interrupted or report_blocked or missing_core or not factual or investigation.get("annotation_unresolved"):
         return "incomplete"
     if any(cell["status"] != "covered" for cell in cells) or any(issue.get("status", "open") == "open" for issue in issues):
         return "completed_with_gaps"

@@ -1,12 +1,18 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
-import { createInvestigation } from "@/core/investigations";
+import {
+  createInvestigation,
+  getResearchOptions,
+  type ResearchMode,
+  type ResearchOptions,
+  type ResearchPerspective,
+} from "@/core/investigations";
 import { readableError } from "@/core/investigations/quality";
 
 const dimensions = ["功能", "定价", "定位", "用户", "壁垒"];
@@ -17,11 +23,30 @@ export default function NewInvestigationPage() {
   const [brief, setBrief] = useState("");
   const [competitors, setCompetitors] = useState("");
   const [requiredDimensions, setRequiredDimensions] = useState<string[]>([]);
+  const [options, setOptions] = useState<ResearchOptions | null>(null);
+  const [mode, setMode] = useState<ResearchMode>("standard");
+  const [perspective, setPerspective] =
+    useState<ResearchPerspective>("product");
+  const [decisionGoal, setDecisionGoal] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  useEffect(() => {
+    let active = true;
+    void getResearchOptions()
+      .then((value) => {
+        if (active) setOptions(value);
+      })
+      .catch((reason: Error) => {
+        if (active) setError(reason.message);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
+    if (!options) return;
     const names = competitors
       .split(/[,，\n]/)
       .map((value) => value.trim())
@@ -36,14 +61,19 @@ export default function NewInvestigationPage() {
       const created = await createInvestigation({
         title,
         brief,
+        mode,
         scope: {
           market: "中国+全球",
-          audience: "产品与战略团队",
+          audience:
+            options.perspectives.find((item) => item.id === perspective)
+              ?.label ?? "产品与战略团队",
           language: "zh-CN",
           time_range: "最近12个月",
           competitors: names,
           dimensions,
           required_dimensions: requiredDimensions,
+          perspective,
+          decision_goal: decisionGoal || brief,
         },
       });
       window.location.assign(`/workspace/investigations/${created.id}`);
@@ -75,6 +105,41 @@ export default function NewInvestigationPage() {
           />
         </label>
         <label className="block space-y-2">
+          <span className="text-sm font-medium">
+            这份报告主要帮助谁做决定？
+          </span>
+          <select
+            className="w-full rounded-md border p-2"
+            value={perspective}
+            onChange={(event) =>
+              setPerspective(event.target.value as ResearchPerspective)
+            }
+          >
+            {options?.perspectives.map((item) => (
+              <option key={item.id} value={item.id}>
+                {item.label}
+              </option>
+            ))}
+          </select>
+          <p className="text-muted-foreground text-xs">
+            {
+              options?.perspectives.find((item) => item.id === perspective)
+                ?.question
+            }
+          </p>
+        </label>
+        <label className="block space-y-2">
+          <span className="text-sm font-medium">
+            这次最想决定什么？（可选）
+          </span>
+          <Input
+            value={decisionGoal}
+            onChange={(event) => setDecisionGoal(event.target.value)}
+            maxLength={1500}
+            placeholder="例如：优先开发哪些功能，或者选择哪款产品"
+          />
+        </label>
+        <label className="block space-y-2">
           <span className="text-sm font-medium">决策背景与目标</span>
           <p className="text-muted-foreground text-xs">
             例如：我们想做一款播放器，需要比较离线播放、投屏和收费方式，判断哪些功能值得优先开发。
@@ -98,6 +163,41 @@ export default function NewInvestigationPage() {
             rows={4}
           />
         </label>
+        <fieldset className="space-y-3">
+          <legend className="text-sm font-medium">选择研究深度</legend>
+          <p className="text-muted-foreground text-xs">
+            档位改变资料量、额度与可用时间；引用核对和来源分级规则相同。
+          </p>
+          <div className="grid gap-3">
+            {options?.modes.map((item) => (
+              <label
+                key={item.id}
+                className="flex items-start gap-3 rounded-lg border p-3"
+              >
+                <input
+                  type="radio"
+                  name="research-mode"
+                  value={item.id}
+                  checked={mode === item.id}
+                  onChange={() => setMode(item.id)}
+                  className="mt-1"
+                />
+                <span>
+                  <span className="font-medium">{item.label}</span>
+                  <span className="text-muted-foreground mt-1 block text-xs">
+                    {item.description}
+                  </span>
+                  <span className="mt-1 block text-xs">
+                    执行时间上限 {item.minutes} 分钟 · 初始分析额度{" "}
+                    {item.base_tokens / 10000}–
+                    {(item.base_tokens + 3 * item.extra_tokens) / 10000} 万
+                    Token（随竞品数量变化）
+                  </span>
+                </span>
+              </label>
+            ))}
+          </div>
+        </fieldset>
         <fieldset className="space-y-3">
           <legend className="text-sm font-medium">
             必须回答的比较项目（可选）
@@ -130,7 +230,7 @@ export default function NewInvestigationPage() {
         {error && (
           <p className="text-destructive text-sm">{readableError(error)}</p>
         )}
-        <Button type="submit" disabled={submitting}>
+        <Button type="submit" disabled={submitting || !options}>
           {submitting ? "创建中…" : "下一步：确认研究范围"}
         </Button>
       </form>

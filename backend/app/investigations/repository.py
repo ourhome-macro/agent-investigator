@@ -9,6 +9,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.investigations.annotation_repository import AnnotationRepository
 from app.investigations.confidence import POLICY_VERSION, assess_support, claim_display_text, completion_state, is_official_source, issue_is_blocking
 from app.investigations.contracts import (
     ClaimCreate,
@@ -46,10 +47,12 @@ from app.investigations.persistence.models import (
     ReportRow,
     ReportSectionRow,
     ResearchCandidateRow,
+    ResearchRequestRow,
     ScopeRow,
     StageAttemptRow,
     WorkflowRunRow,
 )
+from app.investigations.product import policy_for, selected_policy
 from app.investigations.retrieval import chunk_snapshot, hashed_embedding, rank_chunks
 from app.investigations.scoring import credibility_score, independent_source_count
 from app.investigations.state_machine import require_transition
@@ -81,6 +84,7 @@ class InvestigationRepository:
         embedding_provider: EmbeddingProvider | None = None,
     ) -> None:
         self._sf = session_factory
+        self.annotations = AnnotationRepository(session_factory)
         self._artifact_storage = artifact_storage
         self._embedding_provider = embedding_provider
 
@@ -91,6 +95,7 @@ class InvestigationRepository:
     async def create(self, request: InvestigationCreate, *, user_id: str) -> dict[str, Any]:
         now = datetime.now(UTC)
         investigation_id = self._id()
+        policy = selected_policy(request.mode, len(request.scope.competitors))
         async with self._sf() as session, session.begin():
             row = InvestigationRow(
                 id=investigation_id,
@@ -101,8 +106,10 @@ class InvestigationRepository:
                 brief=request.brief,
                 status=InvestigationStatus.PLANNING.value,
                 workflow_version="competitive-research-v2",
-                token_budget=min(525_000, 300_000 + max(0, len(request.scope.competitors) - 2) * 75_000),
-                deadline_at=now + timedelta(minutes=30),
+                token_budget=policy["token_budget"],
+                research_mode=request.mode,
+                policy_snapshot=policy,
+                deadline_at=now + timedelta(minutes=policy["minutes"]),
                 created_at=now,
                 updated_at=now,
             )
@@ -116,6 +123,7 @@ class InvestigationRepository:
                 time_range=request.scope.time_range,
                 dimensions=request.scope.dimensions,
                 required_dimensions=request.scope.required_dimensions,
+                decision_context={"perspective": request.scope.perspective, "decision_goal": request.scope.decision_goal or request.brief},
                 created_at=now,
                 updated_at=now,
             )
@@ -198,7 +206,7 @@ class InvestigationRepository:
             now = datetime.now(UTC)
             if investigation.deadline_at is not None and _utc(investigation.deadline_at) <= now:
                 raise InvestigationDeadlineExceeded("Investigation deadline has expired")
-            reserve_stages = {"auditing", "reworking", "synthesizing"}
+            reserve_stages = {"auditing", "synthesizing"}
             usable_budget = investigation.token_budget if stage in reserve_stages else int(investigation.token_budget * 0.8)
             if investigation.token_used + investigation.token_reserved + max(0, estimated_tokens) > usable_budget:
                 raise InvestigationBudgetExceeded(f"Stage {stage} would exceed its token budget: used={investigation.token_used}, estimated={estimated_tokens}, usable={usable_budget}")
@@ -373,6 +381,10 @@ class InvestigationRepository:
             row.market, row.audience, row.language, row.time_range = scope.market, scope.audience, scope.language, scope.time_range
             row.dimensions, row.updated_at = scope.dimensions, datetime.now(UTC)
             row.required_dimensions = scope.required_dimensions
+            policy = policy_for({"policy_snapshot": investigation.policy_snapshot})
+            investigation.policy_snapshot = {**policy, "token_budget": policy["base_tokens"] + (len(scope.competitors) - 2) * policy["extra_tokens"]}
+            investigation.token_budget = investigation.policy_snapshot["token_budget"]
+            row.decision_context = {"perspective": scope.perspective, "decision_goal": scope.decision_goal or investigation.brief}
             await session.execute(CompetitorRow.__table__.delete().where(CompetitorRow.investigation_id == investigation_id))
             session.add_all(
                 [
@@ -404,6 +416,10 @@ class InvestigationRepository:
             scope_row.time_range = scope.time_range
             scope_row.dimensions = scope.dimensions
             scope_row.required_dimensions = scope.required_dimensions
+            policy = policy_for({"policy_snapshot": investigation.policy_snapshot})
+            investigation.policy_snapshot = {**policy, "token_budget": policy["base_tokens"] + (len(scope.competitors) - 2) * policy["extra_tokens"]}
+            investigation.token_budget = investigation.policy_snapshot["token_budget"]
+            scope_row.decision_context = {"perspective": scope.perspective, "decision_goal": scope.decision_goal or investigation.brief}
             scope_row.updated_at = datetime.now(UTC)
             await session.execute(CompetitorRow.__table__.delete().where(CompetitorRow.investigation_id == investigation_id))
             session.add_all(
@@ -440,6 +456,9 @@ class InvestigationRepository:
             current = InvestigationStatus(row.status)
             require_transition(current, target)
             row.status, row.updated_at = target.value, datetime.now(UTC)
+            if target in {InvestigationStatus.CANCELLING, InvestigationStatus.CANCELLED} and row.active_request_id:
+                await session.execute(update(ResearchRequestRow).where(ResearchRequestRow.id == row.active_request_id, ResearchRequestRow.investigation_id == row.id).values(status="cancelled"))
+                row.active_request_id = None
             session.add(InvestigationEventRow(investigation_id=investigation_id, event_type=event_type, stage=target.value, payload=payload or {}, created_at=datetime.now(UTC)))
         return await self.get(investigation_id, user_id=user_id)
 
@@ -452,6 +471,7 @@ class InvestigationRepository:
                 require_transition(InvestigationStatus(row.status), InvestigationStatus.COLLECTING)
                 scope = (await session.execute(select(ScopeRow).where(ScopeRow.investigation_id == investigation_id).with_for_update())).scalar_one()
                 scope.approved_at = datetime.now(UTC)
+                row.deadline_at = datetime.now(UTC) + timedelta(minutes=policy_for({"policy_snapshot": row.policy_snapshot})["minutes"])
                 row.status, row.updated_at = InvestigationStatus.COLLECTING.value, datetime.now(UTC)
                 session.add(
                     InvestigationEventRow(investigation_id=investigation_id, event_type="ci.stage.started", stage="collecting", payload={"scope_version": scope.version, "idempotency_key": idempotency_key}, created_at=datetime.now(UTC))
@@ -713,6 +733,7 @@ class InvestigationRepository:
                 dimension=request.dimension,
                 text=request.text,
                 normalized_text=" ".join(request.text.casefold().split()),
+                statement=request.statement.model_dump() if request.statement else {},
                 material=request.material,
                 claim_type=request.claim_type,
                 status=status.value,
@@ -829,6 +850,18 @@ class InvestigationRepository:
             result = [self._claim_dict(row, by_claim.get(row.id, [])) for row in rows]
             return [{**claim, "publication_eligible": claim_is_eligible(claim, issues)} for claim in result]
 
+    async def evidence_snapshot(self, investigation_id: str, evidence_id: str, *, user_id: str) -> dict | None:
+        if await self.get(investigation_id, user_id=user_id) is None:
+            return None
+        async with self._sf() as session:
+            evidence = await session.get(EvidenceRow, evidence_id)
+            if evidence is None or evidence.investigation_id != investigation_id or not evidence.snapshot_id:
+                return None
+            snapshot = await session.get(EvidenceSnapshotRow, evidence.snapshot_id)
+            if snapshot is None or snapshot.investigation_id != investigation_id:
+                return None
+            return {"evidence_id": evidence.id, "title": evidence.title, "source_url": evidence.source_url, "retrieved_at": evidence.retrieved_at, "content": snapshot.content_text, "sha256": snapshot.content_hash}
+
     async def list_price_observations(self, investigation_id: str, *, user_id: str) -> list[dict[str, Any]] | None:
         if await self.get(investigation_id, user_id=user_id) is None:
             return None
@@ -843,6 +876,7 @@ class InvestigationRepository:
         *,
         user_id: str,
         auditor: str,
+        claim_ids: set[str] | None = None,
     ) -> None:
         allowed = {"entails", "partially_supports", "contradicts", "unrelated"}
         async with self._sf() as session, session.begin():
@@ -852,8 +886,12 @@ class InvestigationRepository:
             if investigation.status != InvestigationStatus.AUDITING.value:
                 raise InvestigationConflict("Binding verdicts can only be submitted during auditing")
             active_ids = select(ClaimRow.id).where(ClaimRow.investigation_id == investigation_id, ClaimRow.status.not_in(["superseded", "rejected"]))
+            if claim_ids is not None:
+                active_ids = active_ids.where(ClaimRow.id.in_(claim_ids))
             await session.execute(update(ClaimEvidenceRow).where(ClaimEvidenceRow.claim_id.in_(active_ids)).values(entailment_status="pending_audit"))
             for verdict in verdicts:
+                if claim_ids is not None and verdict.get("claim_id") not in claim_ids:
+                    raise InvestigationConflict("Audit verdict is outside its assigned Claim scope")
                 status = str(verdict.get("verdict") or "")
                 if status not in allowed:
                     continue
@@ -881,6 +919,8 @@ class InvestigationRepository:
 
             claims = list((await session.execute(select(ClaimRow).where(ClaimRow.investigation_id == investigation_id))).scalars())
             for claim in claims:
+                if claim_ids is not None and claim.id not in claim_ids:
+                    continue
                 if claim.status in {"superseded", "rejected"}:
                     continue
                 rows = list((await session.execute(select(ClaimEvidenceRow, EvidenceRow).join(EvidenceRow, EvidenceRow.id == ClaimEvidenceRow.evidence_id).where(ClaimEvidenceRow.claim_id == claim.id))).all())
@@ -1134,7 +1174,7 @@ class InvestigationRepository:
             investigation = await session.get(InvestigationRow, investigation_id, with_for_update=True)
             if investigation is None or investigation.user_id != user_id:
                 return None
-            if investigation.rework_round >= 2:
+            if investigation.rework_round >= policy_for({"policy_snapshot": investigation.policy_snapshot})["max_rework_rounds"]:
                 raise InvestigationConflict("Maximum audit rework rounds reached")
             require_transition(InvestigationStatus(investigation.status), InvestigationStatus.REWORKING)
             investigation.status = InvestigationStatus.REWORKING.value
@@ -1267,8 +1307,18 @@ class InvestigationRepository:
         if await self.get(investigation_id, user_id=user_id) is None:
             return None
         async with self._sf() as session, session.begin():
+            investigation = await session.get(InvestigationRow, investigation_id, with_for_update=True)
+            if investigation is None or investigation.user_id != user_id:
+                return None
+            source_task = structured_data.get("source_task_id")
+            if source_task:
+                existing = (await session.execute(select(ReportRow).where(ReportRow.investigation_id == investigation_id, ReportRow.structured_data["source_task_id"].as_string() == source_task))).scalar_one_or_none()
+                if existing:
+                    return {key: getattr(existing, key) for key in ("id", "version", "status", "structured_data", "rendered_markdown", "approved_at", "created_at")}
             latest = (await session.execute(select(func.max(ReportRow.version)).where(ReportRow.investigation_id == investigation_id))).scalar_one_or_none() or 0
-            report = ReportRow(id=self._id(), investigation_id=investigation_id, version=latest + 1, status="review", structured_data=structured_data, rendered_markdown=rendered_markdown)
+            report = ReportRow(
+                id=self._id(), investigation_id=investigation_id, version=latest + 1, status="review", schema_version=structured_data.get("schema_version", "1"), structured_data=structured_data, rendered_markdown=rendered_markdown
+            )
             session.add(report)
             await session.flush()
             for position, section in enumerate(structured_data.get("sections", [])):
@@ -1286,6 +1336,7 @@ class InvestigationRepository:
                 )
             investigation = await session.get(InvestigationRow, investigation_id, with_for_update=True)
             assert investigation is not None
+            await self.annotations.finish_in_transaction(session, investigation, report)
             current = InvestigationStatus(investigation.status)
             if current != InvestigationStatus.AWAITING_PUBLISH_APPROVAL:
                 if not (allow_failed_partial and current == InvestigationStatus.FAILED):
@@ -1408,7 +1459,7 @@ class InvestigationRepository:
             investigation = await session.get(InvestigationRow, investigation_id, with_for_update=True)
             if investigation is None or investigation.user_id != user_id:
                 return None
-            if investigation.rework_round >= 2:
+            if investigation.rework_round >= policy_for({"policy_snapshot": investigation.policy_snapshot})["max_rework_rounds"]:
                 raise InvestigationConflict("Maximum report rework rounds reached")
             report = (await session.execute(select(ReportRow).where(ReportRow.investigation_id == investigation_id, ReportRow.version == report_version).with_for_update())).scalar_one_or_none()
             if report is None:
@@ -1454,6 +1505,8 @@ class InvestigationRepository:
                 "competitors": [item.canonical_name for item in competitors],
                 "dimensions": scope.dimensions,
                 "required_dimensions": scope.required_dimensions,
+                "perspective": (scope.decision_context or {}).get("perspective", "product"),
+                "decision_goal": (scope.decision_context or {}).get("decision_goal", row.brief),
                 "official_domains": {item.canonical_name: item.official_domains for item in competitors if item.official_domains},
                 "official_repositories": {item.canonical_name: item.official_repositories for item in competitors if item.official_repositories},
                 "version": scope.version,
@@ -1464,6 +1517,10 @@ class InvestigationRepository:
             "token_used": row.token_used,
             "token_reserved": row.token_reserved,
             "token_budget": row.token_budget,
+            "research_mode": row.research_mode,
+            "policy_snapshot": row.policy_snapshot,
+            "resource_policy": policy_for({"policy_snapshot": row.policy_snapshot, "token_budget": row.token_budget}),
+            "active_request_id": row.active_request_id,
             "deadline_at": row.deadline_at,
             "created_at": row.created_at,
             "updated_at": row.updated_at,
@@ -1510,6 +1567,7 @@ class InvestigationRepository:
             "status": row.status,
             "independent_source_count": row.independent_source_count,
             "support_basis": row.support_basis,
+            "statement": row.statement,
             "display_text": claim_display_text({"text": row.text, "support_basis": row.support_basis}),
         }
 

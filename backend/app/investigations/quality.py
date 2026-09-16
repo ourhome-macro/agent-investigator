@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.investigations.confidence import POLICY_VERSION, claim_display_text, completion_state, is_official_source, issue_blocks_claim, issue_summary
+from app.investigations.product import decision_context
 from app.investigations.providers import canonicalize_url
 
 
@@ -135,6 +136,7 @@ def _cell(value):
 def render_grounded_report(investigation, sections, claims, evidence, issues, competitors):
     """The model routes IDs and proposes hypotheses; facts are rendered here."""
     eligible = {claim["id"]: claim for claim in claims if claim_is_eligible(claim, issues)}
+    decision = decision_context(investigation["scope"])
     allowed_types = {kind for kind, _ in REPORT_SECTIONS}
     routes = {}
     suggestions = []
@@ -180,6 +182,11 @@ def render_grounded_report(investigation, sections, claims, evidence, issues, co
         if kind == "executive_summary":
             status_label = {"incomplete": "未完成", "completed": "已完成", "completed_with_gaps": "已完成，包含已知缺口"}[completion]
             body = [f"研究状态：{status_label}。可引用 {len(eligible)} 条结论，来源等级分别标注；{len(cells) - len(missing)}/{len(cells)} 个研究单元有产品事实依据。"]
+            body.append(f"决策视角：{decision['label']}。本次要决定：{decision['goal'] or decision['question']}")
+            if investigation.get("annotation"):
+                request = investigation["annotation"]
+                body.append(f"本轮针对第 {request['payload']['report_version']} 版的批注补研：{request['payload']['comment']}。处理结果：{'仍有问题需要确认' if investigation.get('annotation_unresolved') else '已重新核对并生成新版本'}。")
+            ids = list(routes.get(kind, [])[:3])
             body.extend(f"- 关键发现【{claim_labels[cid]}】：{claim_display_text(eligible[cid])}" for cid in routes.get(kind, [])[:3])
             if suggestions:
                 body.append(f"建议验证的方向（假设）：{suggestions[0]['hypothesis']}；下一步：{suggestions[0]['validation']}")
@@ -188,6 +195,7 @@ def render_grounded_report(investigation, sections, claims, evidence, issues, co
         elif kind == "landscape":
             body = ["研究对象：" + "、".join(investigation["scope"]["competitors"])]
         elif kind == "feature_matrix":
+            ids = list(dict.fromkeys(cid for cell in cells for cid in cell["claim_ids"]))
             body = ["| 竞品 | 比较项目 | 资料情况 | 结论与来源说明 | 对应结论 |", "|---|---|---|---|---|"]
             for cell in cells:
                 finding = _cell("；".join(claim_display_text(eligible[cid]) for cid in cell["claim_ids"])) or "未知"
@@ -199,9 +207,12 @@ def render_grounded_report(investigation, sections, claims, evidence, issues, co
         elif kind == "evidence_appendix":
             body = [f"- 【{evidence_labels[item['id']]}】{item['title']} — {item['source_url']}" for item in evidence if item["id"] in cited]
         elif kind == "opportunities":
+            title = decision["section_title"]
+            ids = list(dict.fromkeys(cid for proposal in suggestions for cid in proposal["premise_claim_ids"]))
             body = [f"- **待验证假设**：{item['hypothesis']}\n  前提：{'、'.join(claim_labels[cid] for cid in item['premise_claim_ids'])}；验证动作：{item['validation']}" for item in suggestions]
+            body.insert(0, f"本节回答：{decision['question']}")
             if not suggestions:
-                body = ["本次未发现有充分依据的机会建议。"]
+                body.append("本次未发现有充分依据的机会建议。")
         else:
             for cid in routes.get(kind, []):
                 if cid in used:
@@ -226,6 +237,24 @@ def render_grounded_report(investigation, sections, claims, evidence, issues, co
         "completion_status": completion,
         "coverage_status": "has_gaps" if missing else "complete",
         "title": investigation["title"],
+        "decision": decision,
+        "refinement": {"request_id": investigation["annotation"]["id"], "source_report_version": investigation["annotation"]["payload"]["report_version"], "unresolved": bool(investigation.get("annotation_unresolved"))}
+        if investigation.get("annotation")
+        else None,
+        "claim_snapshots": [
+            {
+                "id": claim["id"],
+                "version": claim.get("version", 1),
+                "competitor_id": claim.get("competitor_id"),
+                "dimension": claim["dimension"],
+                "text": claim["text"],
+                "display_text": claim_display_text(claim),
+                "support_basis": claim.get("support_basis"),
+                "evidence_ids": claim.get("evidence_ids", []),
+                "statement": claim.get("statement", {}),
+            }
+            for claim in eligible.values()
+        ],
         "partial": partial,
         "sections": result,
         "coverage": cells,

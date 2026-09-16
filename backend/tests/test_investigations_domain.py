@@ -74,7 +74,7 @@ async def test_independent_migration_and_repository_round_trip(tmp_path) -> None
         assert "ci_investigations" in tables
         assert "ci_claim_evidence" in tables
         assert "ci_stage_items" in tables
-        assert version == "ci_0011"
+        assert version == "ci_0012"
 
         repository = InvestigationRepository(async_sessionmaker(engine, expire_on_commit=False))
         created = await repository.create(

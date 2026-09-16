@@ -96,7 +96,7 @@ class InvestigationWorkflowService:
                         idempotency_key=(
                             f"{investigation_id}:planning"
                             if investigation["status"] == InvestigationStatus.PLANNING.value
-                            else (f"{investigation_id}:execution:round:{investigation['rework_round']}:recovery:{investigation['failure_retry_count']}")
+                            else (f"{investigation_id}:execution:round:{investigation['rework_round']}:recovery:{investigation['failure_retry_count']}:annotation:{investigation.get('active_request_id') or 'none'}")
                         ),
                     )
                     claimed = await self._orchestration.claim_workflow(

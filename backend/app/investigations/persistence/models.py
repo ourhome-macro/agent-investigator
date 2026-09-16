@@ -30,6 +30,9 @@ class InvestigationRow(InvestigationBase):
     token_used: Mapped[int] = mapped_column(Integer, default=0)
     token_reserved: Mapped[int] = mapped_column(Integer, default=0)
     token_budget: Mapped[int] = mapped_column(Integer, default=300_000)
+    research_mode: Mapped[str] = mapped_column(String(24), default="standard")
+    policy_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+    active_request_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
@@ -47,6 +50,7 @@ class ScopeRow(InvestigationBase):
     time_range: Mapped[str] = mapped_column(String(128))
     dimensions: Mapped[list] = mapped_column(JSON)
     required_dimensions: Mapped[list] = mapped_column(JSON, default=list)
+    decision_context: Mapped[dict] = mapped_column(JSON, default=dict)
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
@@ -161,6 +165,7 @@ class ClaimRow(InvestigationBase):
     status: Mapped[str] = mapped_column(String(24), index=True)
     independent_source_count: Mapped[int] = mapped_column(Integer, default=0)
     support_basis: Mapped[str] = mapped_column(String(32), default="unverified")
+    statement: Mapped[dict] = mapped_column(JSON, default=dict)
     created_by_agent: Mapped[str | None] = mapped_column(String(128), nullable=True)
     version: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
@@ -351,3 +356,17 @@ class ClaimSubmissionRow(InvestigationBase):
     __tablename__ = "ci_claim_submissions"
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     claim_id: Mapped[str] = mapped_column(ForeignKey("ci_claims.id", ondelete="CASCADE"), index=True)
+
+
+class ResearchRequestRow(InvestigationBase):
+    __tablename__ = "ci_research_requests"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    investigation_id: Mapped[str] = mapped_column(ForeignKey("ci_investigations.id", ondelete="CASCADE"), index=True)
+    source_report_id: Mapped[str] = mapped_column(ForeignKey("ci_reports.id"))
+    result_report_id: Mapped[str | None] = mapped_column(ForeignKey("ci_reports.id"), nullable=True)
+    payload: Mapped[dict] = mapped_column(JSON)
+    target: Mapped[dict] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String(32), default="queued")
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    token_allowance: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)

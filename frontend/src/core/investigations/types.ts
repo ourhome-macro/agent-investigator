@@ -24,6 +24,8 @@ export interface ResearchScope {
   official_domains?: Record<string, string[]>;
   official_repositories?: Record<string, string[]>;
   required_dimensions?: string[];
+  perspective?: ResearchPerspective;
+  decision_goal?: string;
   version?: number;
   approved_at?: string | null;
 }
@@ -41,6 +43,10 @@ export interface Investigation {
   token_used: number;
   token_reserved?: number;
   token_budget: number;
+  research_mode?: ResearchMode;
+  policy_snapshot?: ResearchPolicy;
+  resource_policy?: ResearchPolicy;
+  active_request_id?: string | null;
   deadline_at: string | null;
   created_at: string;
   updated_at: string;
@@ -63,6 +69,14 @@ export interface Claim {
   id: string;
   dimension: string;
   text: string;
+  version?: number;
+  competitor_id?: string | null;
+  statement?: {
+    subject?: string;
+    predicate?: string;
+    object?: string;
+    conditions?: string;
+  };
   material: boolean;
   evidence_ids: string[];
   evidence_bindings: Array<{
@@ -129,7 +143,98 @@ export interface Report {
     partial?: boolean;
     completion_status?: "incomplete" | "completed" | "completed_with_gaps";
     coverage_status?: "complete" | "has_gaps";
+    sections?: ReportSection[];
+    coverage?: CoverageCell[];
+    claim_versions?: Record<string, number>;
+    claim_snapshots?: Array<
+      Pick<Claim, "id" | "text" | "display_text" | "version">
+    >;
+    decision?: {
+      perspective: ResearchPerspective;
+      label: string;
+      goal: string;
+      question: string;
+    };
   };
+}
+
+export type ResearchMode = "quick" | "standard" | "deep";
+export type ResearchPerspective =
+  | "product"
+  | "purchase"
+  | "sales"
+  | "operations";
+export interface ResearchPolicy {
+  mode: ResearchMode;
+  label: string;
+  description: string;
+  base_tokens: number;
+  extra_tokens: number;
+  token_budget: number;
+  minutes: number;
+  search_results: number;
+  max_rework_rounds: number;
+  refinement_tokens: number;
+  refinement_minutes: number;
+  max_annotations: number;
+}
+export interface ResearchOptions {
+  modes: Array<ResearchPolicy & { id: ResearchMode }>;
+  perspectives: Array<{
+    id: ResearchPerspective;
+    label: string;
+    question: string;
+    section_title: string;
+  }>;
+}
+export interface ReportSection {
+  id: string;
+  type: string;
+  title: string;
+  markdown: string;
+  claim_ids: string[];
+  evidence_ids: string[];
+}
+export interface EvidenceSnapshot {
+  evidence_id: string;
+  title: string;
+  source_url: string;
+  content: string;
+  sha256: string;
+  retrieved_at: string;
+}
+export interface AnnotationInput {
+  report_version: number;
+  section_key: string;
+  selected_text: string;
+  comment: string;
+  action: "recollect" | "revise" | "investigate_conflict";
+  claim_id?: string;
+  claim_version?: number;
+  competitor_id?: string;
+  dimension?: string;
+  idempotency_key: string;
+}
+export interface ResearchAnnotation {
+  id: string;
+  source_report_id: string;
+  result_report_id: string | null;
+  status:
+    | "queued"
+    | "running"
+    | "completed"
+    | "needs_review"
+    | "failed"
+    | "cancelled";
+  payload: AnnotationInput;
+  target: {
+    claim_id: string | null;
+    claim_version: number | null;
+    competitor_id: string;
+    dimension: string;
+  };
+  token_allowance: number;
+  error?: string | null;
 }
 
 export interface CoverageCell {
